@@ -4,7 +4,6 @@ import io
 import time
 import math
 import json
-import traceback
 from typing import Tuple, Dict, Any, List
 
 import numpy as np
@@ -45,9 +44,9 @@ def template_files() -> Dict[str, bytes]:
     out = {}
     # Sites.xlsx
     df_sites = pd.DataFrame([
-        {"Site Name": "Example Plant A", "Latitude": 52.2297, "Longitude": 21.0122}, # Warsaw
-        {"Site Name": "Example Plant B", "Latitude": 48.1486, "Longitude": 17.1077}, # Bratislava
-        {"Site Name": "Example Plant C", "Latitude": 50.1109, "Longitude": 8.6821},  # Frankfurt
+        {"Site Name": "Example Plant A", "Latitude": 52.2297, "Longitude": 21.0122},
+        {"Site Name": "Example Plant B", "Latitude": 48.1486, "Longitude": 17.1077},
+        {"Site Name": "Example Plant C", "Latitude": 50.1109, "Longitude": 8.6821},
     ])
     b = io.BytesIO()
     with pd.ExcelWriter(b, engine="xlsxwriter") as xw:
@@ -59,7 +58,7 @@ def template_files() -> Dict[str, bytes]:
         {"Airport Name": "Frankfurt Airport", "IATA": "FRA", "Latitude": 50.0379, "Longitude": 8.5622},
         {"Airport Name": "Warsaw Chopin Airport", "IATA": "WAW", "Latitude": 52.1657, "Longitude": 20.9671},
         {"Airport Name": "Vienna International Airport", "IATA": "VIE", "Latitude": 48.1103, "Longitude": 16.5697},
-        {"Airport Name": "Prague Václav Havel", "IATA": "PRG", "Latitude": 50.1008, "Longitude": 14.26},
+        {"Airport Name": "Prague Vaclav Havel", "IATA": "PRG", "Latitude": 50.1008, "Longitude": 14.26},
         {"Airport Name": "Amsterdam Schiphol", "IATA": "AMS", "Latitude": 52.3105, "Longitude": 4.7683},
     ])
     b = io.BytesIO()
@@ -308,9 +307,6 @@ def process_batch(sites: pd.DataFrame,
         if progress_hook:
             progress_hook(f"Processed {len(results)}/{total}")
 
-        if progress_hook:
-            progress_hook(f"Processed {len(results)}/{total}")
-
     st.session_state["route_cache"] = route_cache
     df_res = pd.DataFrame(results)
     return df_res, logs, api_calls
@@ -328,7 +324,7 @@ def sidebar():
 
     st.sidebar.subheader("Rate limiting")
     pause_every = st.sidebar.number_input("Pause after X API calls", min_value=0, max_value=500, value=35, step=1,
-                                          help="0 disables pausing. ORS free tier is ~40 req/min.")
+                                          help="0 disables pausing. ORS free tier is about 40 req/min.")
     pause_secs = st.sidebar.number_input("Pause duration (seconds)", min_value=0.0, max_value=120.0, value=60.0, step=5.0)
 
     st.sidebar.subheader("Reference location")
@@ -550,50 +546,46 @@ if __name__ == "__main__":
 # ----------------------
 # README.md (one-page)
 # ----------------------
-# Road Distance Finder – Browser App
+# Road Distance Finder - Browser App
 
-**What it does**  
-Upload three Excel files (Sites, Airports, Seaports). The app preselects the Top‑N nearest airports/ports by Haversine and then calls OpenRouteService (driving‑car) to find the true nearest by road (distance & time). Optionally computes road distance/time to an editable reference location (default: Bedburg, Germany).
+What it does
+Upload three Excel files (Sites, Airports, Seaports). The app preselects the Top-N nearest airports/ports by Haversine and then calls OpenRouteService (driving-car) to find the true nearest by road (distance and time). Optionally computes road distance/time to an editable reference location (default: Bedburg, Germany).
 
-**Inputs**
-- Sites.xlsx → sheet "Sites": Site Name, Latitude, Longitude  
-- Airports.xlsx → sheet "Airports": Airport Name, IATA (optional), Latitude, Longitude  
-- Seaports.xlsx → sheet "Seaports": Seaport Name, UNLOCODE (optional), Latitude, Longitude  
+Inputs
+- Sites.xlsx -> sheet "Sites": Site Name, Latitude, Longitude
+- Airports.xlsx -> sheet "Airports": Airport Name, IATA (optional), Latitude, Longitude
+- Seaports.xlsx -> sheet "Seaports": Seaport Name, UNLOCODE (optional), Latitude, Longitude
 - OpenRouteService API key (kept in session only)
 
-**Outputs**
+Outputs
 - Interactive table with: Site Name, Latitude, Longitude, Nearest Airport, Distance to Airport (km), Time to Airport (min), Nearest Seaport, Distance to Seaport (km), Time to Seaport (min), Distance/Time to Reference (if enabled).
 - Downloads: CSV and XLSX. Decimal dot; km/min units.
 
-**How to deploy (no local setup)**
-- Streamlit Community Cloud: create a public repo with `app.py` and `requirements.txt` → "New app" → select repo → deploy.  
-- Hugging Face Spaces: new Space → SDK = Streamlit → upload the same two files (plus this README) → Deploy.  
-- Vercel: wrap with a small FastAPI/ASGI runner or use `streamlit` buildpack; Streamlit Cloud is simpler.
+How to deploy (no local setup)
+- Streamlit Community Cloud: create a public repo with app.py and requirements.txt -> "New app" -> select repo -> deploy.
+- Hugging Face Spaces: new Space -> SDK = Streamlit -> upload the same two files (plus this README) -> Deploy.
 
-**Settings** (sidebar)
-- Top‑N candidates (default 3)
-- Pause after X API calls (default 35) and Pause seconds (default 60) for rate‑limit compliance
+Settings (sidebar)
+- Top-N candidates (default 3)
+- Pause after X API calls (default 35) and Pause seconds (default 60) for rate-limit compliance
 - Reference toggle and coordinates (default: Bedburg 51.0126, 6.5741)
 - Clear cache
 
-**Performance & quotas**
-- Calls ORS only for Top‑N candidates per site (+ reference if enabled).  
-- Visible progress bar and API call counter; configurable pauses.  
-- Session‑level memoization avoids repeated origin→destination calls within a run.
+Performance and quotas
+- Calls ORS only for Top-N candidates per site (+ reference if enabled).
+- Visible progress bar and API call counter; configurable pauses.
+- Session-level memoization avoids repeated origin-destination calls within a run.
 
-**Validation & errors**
-- Strict header checks; latitude/longitude range checks.  
-- Per‑site processing log with graceful error capture.  
-- If routing fails for a candidate, it’s skipped; if all fail, the field shows ERROR.
+Validation and errors
+- Strict header checks; latitude/longitude range checks.
+- Per-site processing log with graceful error capture.
+- If routing fails for a candidate, it is skipped; if all fail, the field shows ERROR.
 
-**Privacy**
-- API key is stored only in session memory and never written to disk or exports.  
+Privacy
+- API key is stored only in session memory and never written to disk or exports.
 - Uploads are processed in memory; downloads contain only computed results.
 
-**Nice‑to‑haves**
-- Optional folium map preview of nearest picks; enable via checkbox.
-
-**Notes**
-- ORS expects coordinates as (lon, lat). This app handles conversion internally.  
-- Distances returned by ORS are already in km; durations are converted to minutes.  
-- Large lists (thousands of airports/ports) are supported; Top‑N prefilter keeps API usage low.
+Notes
+- ORS expects coordinates as (lon, lat). The app handles conversion internally.
+- Distances returned by ORS are already in km; durations are converted to minutes.
+- Large lists (thousands of airports/ports) are supported; Top-N prefilter keeps API usage low.
