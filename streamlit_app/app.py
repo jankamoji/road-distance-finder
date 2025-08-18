@@ -1,3 +1,5 @@
+# app.py
+
 import io
 import time
 import math
@@ -117,11 +119,12 @@ def get_route_ors(api_key: str,
             if resp.status_code == 200:
                 data = resp.json()
                 summary = data["features"][0]["properties"]["summary"]
-                distance_km = float(summary["distance"])  # already in km
+                distance_km = float(summary["distance"])  # already in km due to units="km"
                 duration_min = float(summary["duration"]) / 60.0
                 route_cache[key] = {"distance_km": distance_km, "duration_min": duration_min}
                 return distance_km, duration_min
             elif resp.status_code == 429:
+                # Rate limit - backoff
                 time.sleep(backoff_s * (attempt + 1))
             else:
                 last_err = f"HTTP {resp.status_code}: {resp.text[:200]}"
@@ -176,7 +179,9 @@ def process_batch(sites: pd.DataFrame,
         seaports[col] = pd.to_numeric(seaports[col], errors="coerce")
 
     # Validation
-    err = _validate_latlon(sites["Latitude"], sites["Longitude"]) or           _validate_latlon(airports["Latitude"], airports["Longitude"]) or           _validate_latlon(seaports["Latitude"], seaports["Longitude"]) 
+    err = _validate_latlon(sites["Latitude"], sites["Longitude"]) or \
+          _validate_latlon(airports["Latitude"], airports["Longitude"]) or \
+          _validate_latlon(seaports["Latitude"], seaports["Longitude"]) 
     if err:
         raise ValueError(err)
 
@@ -296,7 +301,12 @@ def process_batch(sites: pd.DataFrame,
 
         except Exception as e:
             log_rec["steps"].append({"fatal": str(e)})
+
+        logs.append(log_rec)
         results.append(out_rec)
+
+        if progress_hook:
+            progress_hook(f"Processed {len(results)}/{total}")
 
         if progress_hook:
             progress_hook(f"Processed {len(results)}/{total}")
@@ -478,6 +488,8 @@ def main():
                 progress_hook=progress_hook,
             )
             st.success(f"Completed. API calls: {api_calls}. Cached routes: {len(st.session_state.get('route_cache', {}))}.")
+            if api_calls == 0:
+                st.warning("No successful routing calls. Check your ORS API key/permissions, quotas, or sheet contents. See Processing log for HTTP codes.")
 
             # Rename reference columns to current label
             if use_ref:
@@ -522,3 +534,66 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+# ----------------------
+# requirements.txt
+# ----------------------
+# streamlit
+# pandas
+# numpy
+# requests
+# openpyxl
+# xlsxwriter
+# folium
+# streamlit-folium
+
+# ----------------------
+# README.md (one-page)
+# ----------------------
+# Road Distance Finder – Browser App
+
+**What it does**  
+Upload three Excel files (Sites, Airports, Seaports). The app preselects the Top‑N nearest airports/ports by Haversine and then calls OpenRouteService (driving‑car) to find the true nearest by road (distance & time). Optionally computes road distance/time to an editable reference location (default: Bedburg, Germany).
+
+**Inputs**
+- Sites.xlsx → sheet "Sites": Site Name, Latitude, Longitude  
+- Airports.xlsx → sheet "Airports": Airport Name, IATA (optional), Latitude, Longitude  
+- Seaports.xlsx → sheet "Seaports": Seaport Name, UNLOCODE (optional), Latitude, Longitude  
+- OpenRouteService API key (kept in session only)
+
+**Outputs**
+- Interactive table with: Site Name, Latitude, Longitude, Nearest Airport, Distance to Airport (km), Time to Airport (min), Nearest Seaport, Distance to Seaport (km), Time to Seaport (min), Distance/Time to Reference (if enabled).
+- Downloads: CSV and XLSX. Decimal dot; km/min units.
+
+**How to deploy (no local setup)**
+- Streamlit Community Cloud: create a public repo with `app.py` and `requirements.txt` → "New app" → select repo → deploy.  
+- Hugging Face Spaces: new Space → SDK = Streamlit → upload the same two files (plus this README) → Deploy.  
+- Vercel: wrap with a small FastAPI/ASGI runner or use `streamlit` buildpack; Streamlit Cloud is simpler.
+
+**Settings** (sidebar)
+- Top‑N candidates (default 3)
+- Pause after X API calls (default 35) and Pause seconds (default 60) for rate‑limit compliance
+- Reference toggle and coordinates (default: Bedburg 51.0126, 6.5741)
+- Clear cache
+
+**Performance & quotas**
+- Calls ORS only for Top‑N candidates per site (+ reference if enabled).  
+- Visible progress bar and API call counter; configurable pauses.  
+- Session‑level memoization avoids repeated origin→destination calls within a run.
+
+**Validation & errors**
+- Strict header checks; latitude/longitude range checks.  
+- Per‑site processing log with graceful error capture.  
+- If routing fails for a candidate, it’s skipped; if all fail, the field shows ERROR.
+
+**Privacy**
+- API key is stored only in session memory and never written to disk or exports.  
+- Uploads are processed in memory; downloads contain only computed results.
+
+**Nice‑to‑haves**
+- Optional folium map preview of nearest picks; enable via checkbox.
+
+**Notes**
+- ORS expects coordinates as (lon, lat). This app handles conversion internally.  
+- Distances returned by ORS are already in km; durations are converted to minutes.  
+- Large lists (thousands of airports/ports) are supported; Top‑N prefilter keeps API usage low.
