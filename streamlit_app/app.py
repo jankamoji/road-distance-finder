@@ -10,7 +10,11 @@ import numpy as np
 import pandas as pd
 import requests
 import streamlit as st
-from streamlit.runtime.uploaded_file_manager import UploadedFile
+# UploadedFile is only used for type hints; make this import optional for broader Streamlit compatibility
+try:
+    from streamlit.runtime.uploaded_file_manager import UploadedFile  # Streamlit >=1.30
+except Exception:  # older Streamlit builds
+    from typing import Any as UploadedFile
 
 try:
     from streamlit_folium import st_folium
