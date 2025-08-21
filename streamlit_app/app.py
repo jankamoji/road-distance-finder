@@ -515,22 +515,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-# ----------------------
-# requirements.txt
-# ----------------------
-# Minimal, unpinned (lets Streamlit Cloud pick Python-3.13-compatible wheels quickly)
-streamlit
-pandas
-numpy
-requests
-openpyxl
-xlsxwriter
-# Optional map preview (comment out if you want even faster startup)
-# folium
-# streamlit-folium
-
-# ----------------------
-# runtime.txt
-# ----------------------
-3.11
