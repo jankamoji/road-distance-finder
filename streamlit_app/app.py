@@ -10,12 +10,14 @@ import numpy as np
 import pandas as pd
 import requests
 import streamlit as st
-# UploadedFile is only used for type hints; make this import optional for broader Streamlit compatibility
+
+# UploadedFile is only for type hints; keep import optional for older Streamlit
 try:
     from streamlit.runtime.uploaded_file_manager import UploadedFile  # Streamlit >=1.30
-except Exception:  # older Streamlit builds
+except Exception:
     from typing import Any as UploadedFile
 
+# Optional map dependencies
 try:
     from streamlit_folium import st_folium
     import folium
@@ -84,10 +86,57 @@ def template_files() -> Dict[str, bytes]:
 
     return out
 
-# ---------------------- ORS Routing ----------------------
+# ---------------------- ORS Snapping + Routing ----------------------
 
-def _route_cache_key(origin: Tuple[float, float], dest: Tuple[float, float]) -> str:
-    return f"{origin[0]:.6f},{origin[1]:.6f}->{dest[0]:.6f},{dest[1]:.6f}"
+SNAP_URL = "https://api.openrouteservice.org/v2/nearest/driving-car"
+
+@st.cache_data(show_spinner=False)
+def _snap_cache_key(lat, lon):
+    return f"{lat:.6f},{lon:.6f}"
+
+def snap_to_road(api_key: str, lat: float, lon: float, timeout_s: int = 15) -> Tuple[float, float]:
+    """Snap (lat, lon) to the nearest routable point. Fall back to original on failure."""
+    key = _snap_cache_key(lat, lon)
+    cache = st.session_state.get("snap_cache", {})
+    if key in cache:
+        return cache[key]
+
+    headers = {"Authorization": api_key, "Content-Type": "application/json"}
+    body = {"coordinates": [[float(lon), float(lat)]]}
+    try:
+        r = requests.post(SNAP_URL, headers=headers, data=json.dumps(body), timeout=timeout_s)
+        if r.status_code == 200:
+            data = r.json()
+            coords = None
+            if isinstance(data, dict):
+                if "coordinates" in data and data["coordinates"]:
+                    coords = data["coordinates"][0]
+                elif "features" in data and data["features"]:
+                    coords = data["features"][0]["geometry"]["coordinates"]
+            if coords and len(coords) >= 2:
+                snapped = (float(coords[1]), float(coords[0]))
+                cache[key] = snapped
+                st.session_state["snap_cache"] = cache
+                return snapped
+    except Exception:
+        pass
+    cache[key] = (lat, lon)
+    st.session_state["snap_cache"] = cache
+    return lat, lon
+
+def _parse_ors_summary(resp: requests.Response) -> Tuple[float, float]:
+    try:
+        data = resp.json()
+    except Exception:
+        raise RuntimeError(f"HTTP {resp.status_code}: non-JSON response")
+    try:
+        summary = data["features"][0]["properties"]["summary"]
+        distance_km = float(summary["distance"])  # km
+        duration_min = float(summary["duration"]) / 60.0
+        return distance_km, duration_min
+    except Exception:
+        snippet = json.dumps(data)[:240]
+        raise RuntimeError(f"HTTP {resp.status_code}: unexpected body: {snippet}")
 
 def get_route_ors(api_key: str,
                   origin: Tuple[float, float],
@@ -97,18 +146,22 @@ def get_route_ors(api_key: str,
                   backoff_s: float = 2.0,
                   route_cache: Dict[str, Dict[str, float]] = None
                   ) -> Tuple[float, float]:
+    """Driving route with snapping + caching. Returns (distance_km, duration_min)."""
     if route_cache is None:
         route_cache = {}
-    key = _route_cache_key(origin, dest)
+
+    # snap endpoints
+    o_lat, o_lon = snap_to_road(api_key, origin[0], origin[1])
+    d_lat, d_lon = snap_to_road(api_key, dest[0], dest[1])
+
+    key = f"{o_lat:.6f},{o_lon:.6f}->{d_lat:.6f},{d_lon:.6f}"
     if key in route_cache:
-        return route_cache[key]["distance_km"], route_cache[key]["duration_min"]
+        v = route_cache[key]
+        return v["distance_km"], v["duration_min"]
 
     url = "https://api.openrouteservice.org/v2/directions/driving-car"
     headers = {"Authorization": api_key, "Content-Type": "application/json"}
-    body = {
-        "coordinates": [ [origin[1], origin[0]], [dest[1], dest[0]] ],
-        "units": "km"
-    }
+    body = {"coordinates": [[o_lon, o_lat], [d_lon, d_lat]], "units": "km", "resolve_locations": True}
 
     attempt = 0
     last_err = None
@@ -116,17 +169,17 @@ def get_route_ors(api_key: str,
         try:
             resp = requests.post(url, headers=headers, data=json.dumps(body), timeout=timeout_s)
             if resp.status_code == 200:
-                data = resp.json()
-                summary = data["features"][0]["properties"]["summary"]
-                distance_km = float(summary["distance"])  # already km
-                duration_min = float(summary["duration"]) / 60.0
+                distance_km, duration_min = _parse_ors_summary(resp)
                 route_cache[key] = {"distance_km": distance_km, "duration_min": duration_min}
                 return distance_km, duration_min
-            elif resp.status_code == 429:
+            elif resp.status_code in (429, 503):
                 time.sleep(backoff_s * (attempt + 1))
             else:
-                last_err = f"HTTP {resp.status_code}: {resp.text[:200]}"
-                break
+                # will raise with helpful message
+                try:
+                    _parse_ors_summary(resp)
+                except Exception as e:
+                    last_err = str(e)
         except Exception as e:
             last_err = str(e)
         attempt += 1
@@ -138,7 +191,6 @@ def get_route_ors(api_key: str,
 
 def _validate_columns(df: pd.DataFrame, required_cols: List[str]) -> List[str]:
     return [c for c in required_cols if c not in df.columns]
-
 
 def _validate_latlon(lat: pd.Series, lon: pd.Series) -> str:
     try:
@@ -163,9 +215,7 @@ def process_batch(sites: pd.DataFrame,
                   pause_every: int,
                   pause_secs: float,
                   progress_hook=None) -> Tuple[pd.DataFrame, List[Dict[str, Any]], int]:
-    sites = sites.copy()
-    airports = airports.copy()
-    seaports = seaports.copy()
+    sites = sites.copy(); airports = airports.copy(); seaports = seaports.copy()
 
     for col in ["Latitude", "Longitude"]:
         sites[col] = pd.to_numeric(sites[col], errors="coerce")
@@ -178,10 +228,8 @@ def process_batch(sites: pd.DataFrame,
     if err:
         raise ValueError(err)
 
-    a_lat = airports["Latitude"].to_numpy()
-    a_lon = airports["Longitude"].to_numpy()
-    p_lat = seaports["Latitude"].to_numpy()
-    p_lon = seaports["Longitude"].to_numpy()
+    a_lat = airports["Latitude"].to_numpy(); a_lon = airports["Longitude"].to_numpy()
+    p_lat = seaports["Latitude"].to_numpy(); p_lon = seaports["Longitude"].to_numpy()
 
     route_cache = st.session_state.get("route_cache", {})
 
@@ -190,10 +238,9 @@ def process_batch(sites: pd.DataFrame,
     api_calls = 0
 
     total = len(sites)
-    for i, row in sites.iterrows():
+    for _, row in sites.iterrows():
         site_name = str(row["Site Name"]).strip()
-        slat = float(row["Latitude"])
-        slon = float(row["Longitude"])
+        slat = float(row["Latitude"]); slon = float(row["Longitude"]) 
         site_origin = (slat, slon)
 
         log_rec = {"site": site_name, "steps": []}
@@ -213,27 +260,23 @@ def process_batch(sites: pd.DataFrame,
             out_rec[f"Time to {DEFAULT_REF['name']} (min)"] = None
 
         try:
+            # Airports: Haversine preselect
             dists_a = haversine_km(slat, slon, a_lat, a_lon)
             idxs_a = np.argsort(dists_a)[: min(topn, len(airports))]
             cand_airports = airports.iloc[idxs_a].copy()
-            log_rec["steps"].append({"msg": f"Top-{len(cand_airports)} airports by air distance: {cand_airports['Airport Name'].tolist()}"})
+            log_rec["steps"].append({"msg": f"Top-{len(cand_airports)} airports: {cand_airports['Airport Name'].tolist()}"})
 
-            best_air = None
-            best_air_d = math.inf
-            best_air_t = math.inf
+            best_air = None; best_air_d = math.inf; best_air_t = math.inf
             for _, a in cand_airports.iterrows():
                 dest = (float(a["Latitude"]), float(a["Longitude"]))
                 try:
                     if api_calls and pause_every and api_calls % pause_every == 0:
-                        if progress_hook:
-                            progress_hook(f"Pausing {pause_secs}s to respect rate limits...")
+                        if progress_hook: progress_hook(f"Pausing {pause_secs}s to respect rate limits...")
                         time.sleep(pause_secs)
                     dist_km, dur_min = get_route_ors(api_key, site_origin, dest, route_cache=route_cache)
                     api_calls += 1
                     if dist_km < best_air_d:
-                        best_air_d = dist_km
-                        best_air_t = dur_min
-                        best_air = a
+                        best_air_d = dist_km; best_air_t = dur_min; best_air = a
                 except Exception as e:
                     log_rec["steps"].append({"error": f"Airport '{a['Airport Name']}': {e}"})
 
@@ -244,27 +287,23 @@ def process_batch(sites: pd.DataFrame,
             else:
                 out_rec["Nearest Airport"] = "ERROR"
 
+            # Seaports: Haversine preselect
             dists_p = haversine_km(slat, slon, p_lat, p_lon)
             idxs_p = np.argsort(dists_p)[: min(topn, len(seaports))]
             cand_ports = seaports.iloc[idxs_p].copy()
-            log_rec["steps"].append({"msg": f"Top-{len(cand_ports)} seaports by air distance: {cand_ports['Seaport Name'].tolist()}"})
+            log_rec["steps"].append({"msg": f"Top-{len(cand_ports)} seaports: {cand_ports['Seaport Name'].tolist()}"})
 
-            best_port = None
-            best_port_d = math.inf
-            best_port_t = math.inf
+            best_port = None; best_port_d = math.inf; best_port_t = math.inf
             for _, p in cand_ports.iterrows():
                 dest = (float(p["Latitude"]), float(p["Longitude"]))
                 try:
                     if api_calls and pause_every and api_calls % pause_every == 0:
-                        if progress_hook:
-                            progress_hook(f"Pausing {pause_secs}s to respect rate limits...")
+                        if progress_hook: progress_hook(f"Pausing {pause_secs}s to respect rate limits...")
                         time.sleep(pause_secs)
                     dist_km, dur_min = get_route_ors(api_key, site_origin, dest, route_cache=route_cache)
                     api_calls += 1
                     if dist_km < best_port_d:
-                        best_port_d = dist_km
-                        best_port_t = dur_min
-                        best_port = p
+                        best_port_d = dist_km; best_port_t = dur_min; best_port = p
                 except Exception as e:
                     log_rec["steps"].append({"error": f"Seaport '{p['Seaport Name']}': {e}"})
 
@@ -275,11 +314,11 @@ def process_batch(sites: pd.DataFrame,
             else:
                 out_rec["Nearest Seaport"] = "ERROR"
 
+            # Reference
             if include_ref:
                 try:
                     if api_calls and pause_every and api_calls % pause_every == 0:
-                        if progress_hook:
-                            progress_hook(f"Pausing {pause_secs}s to respect rate limits...")
+                        if progress_hook: progress_hook(f"Pausing {pause_secs}s to respect rate limits...")
                         time.sleep(pause_secs)
                     dist_km, dur_min = get_route_ors(api_key, site_origin, (ref_lat, ref_lon), route_cache=route_cache)
                     api_calls += 1
@@ -293,9 +332,7 @@ def process_batch(sites: pd.DataFrame,
 
         logs.append(log_rec)
         results.append(out_rec)
-
-        if progress_hook:
-            progress_hook(f"Processed {len(results)}/{total}")
+        if progress_hook: progress_hook(f"Processed {len(results)}/{total}")
 
     st.session_state["route_cache"] = route_cache
     df_res = pd.DataFrame(results)
@@ -398,8 +435,7 @@ def maybe_map(df: pd.DataFrame, airports: pd.DataFrame, seaports: pd.DataFrame):
     if df.empty:
         return
     st.subheader("Map preview (nearest picks)")
-    mean_lat = df["Latitude"].mean()
-    mean_lon = df["Longitude"].mean()
+    mean_lat = df["Latitude"].mean(); mean_lon = df["Longitude"].mean()
     m = folium.Map(location=[mean_lat, mean_lon], zoom_start=5)
 
     for _, r in df.iterrows():
@@ -447,15 +483,10 @@ def main():
             st.error("Uploaded files must contain at least one row in each sheet.")
             return
 
-        status = st.empty()
-        pbar = st.progress(0)
-        total = len(sites_df)
-
+        status = st.empty(); pbar = st.progress(0); total = len(sites_df)
         def progress_hook(msg: str):
             if "Processed" in msg:
-                parts = msg.split()
-                done = int(parts[1].split("/")[0])
-                pbar.progress(min(done/total, 1.0))
+                parts = msg.split(); done = int(parts[1].split("/")[0]); pbar.progress(min(done/total, 1.0))
             status.info(msg)
 
         try:
@@ -472,7 +503,7 @@ def main():
             )
             st.success(f"Completed. API calls: {api_calls}. Cached routes: {len(st.session_state.get('route_cache', {}))}.")
             if api_calls == 0:
-                st.warning("No successful routing calls. Check your ORS API key/permissions, quotas, or sheet contents. See Processing log for HTTP codes.")
+                st.warning("No successful routing calls. Check your ORS key/permissions or quotas. See Processing log below.")
 
             if use_ref:
                 df_res = df_res.rename(columns={
@@ -498,12 +529,9 @@ def main():
                 for rec in logs:
                     st.write(f"### {rec['site']}")
                     for step in rec["steps"]:
-                        if "msg" in step:
-                            st.write("- " + step["msg"])
-                        if "error" in step:
-                            st.error("- " + step["error"])
-                        if "fatal" in step:
-                            st.error("FATAL: " + step["fatal"])
+                        if "msg" in step: st.write("- " + step["msg"])
+                        if "error" in step: st.error("- " + step["error"])
+                        if "fatal" in step: st.error("FATAL: " + step["fatal"])
 
             if st.checkbox("Show map preview (optional)"):
                 maybe_map(df_res, airports_df, seaports_df)
