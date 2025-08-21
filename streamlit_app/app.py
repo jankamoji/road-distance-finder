@@ -31,6 +31,10 @@ REQUIRED_SITES_COLS = ["Site Name", "Latitude", "Longitude"]
 REQUIRED_AIRPORTS_COLS = ["Airport Name", "Latitude", "Longitude"]
 REQUIRED_SEAPORTS_COLS = ["Seaport Name", "Latitude", "Longitude"]
 
+# Provider constants
+PROVIDER_ORS = "ORS"
+PROVIDER_OSRM = "OSRM"
+
 # ---------------------- Utilities ----------------------
 
 def haversine_km(lat1, lon1, lat2, lon2):
@@ -86,21 +90,21 @@ def template_files() -> Dict[str, bytes]:
 
     return out
 
-# ---------------------- ORS Snapping + Routing ----------------------
+# ---------------------- Routing Engines ----------------------
 
+# ORS snap + directions
 SNAP_URL = "https://api.openrouteservice.org/v2/nearest/driving-car"
+ORS_DIR_URL = "https://api.openrouteservice.org/v2/directions/driving-car"
 
 @st.cache_data(show_spinner=False)
 def _snap_cache_key(lat, lon):
     return f"{lat:.6f},{lon:.6f}"
 
 def snap_to_road(api_key: str, lat: float, lon: float, timeout_s: int = 15) -> Tuple[float, float]:
-    """Snap (lat, lon) to the nearest routable point. Fall back to original on failure."""
     key = _snap_cache_key(lat, lon)
     cache = st.session_state.get("snap_cache", {})
     if key in cache:
         return cache[key]
-
     headers = {"Authorization": api_key, "Content-Type": "application/json"}
     body = {"coordinates": [[float(lon), float(lat)]]}
     try:
@@ -138,44 +142,27 @@ def _parse_ors_summary(resp: requests.Response) -> Tuple[float, float]:
         snippet = json.dumps(data)[:240]
         raise RuntimeError(f"HTTP {resp.status_code}: unexpected body: {snippet}")
 
-def get_route_ors(api_key: str,
+def route_via_ors(api_key: str,
                   origin: Tuple[float, float],
                   dest: Tuple[float, float],
                   timeout_s: int = 20,
                   max_retries: int = 3,
-                  backoff_s: float = 2.0,
-                  route_cache: Dict[str, Dict[str, float]] = None
-                  ) -> Tuple[float, float]:
-    """Driving route with snapping + caching. Returns (distance_km, duration_min)."""
-    if route_cache is None:
-        route_cache = {}
-
+                  backoff_s: float = 2.0) -> Tuple[float, float]:
     # snap endpoints
     o_lat, o_lon = snap_to_road(api_key, origin[0], origin[1])
     d_lat, d_lon = snap_to_road(api_key, dest[0], dest[1])
-
-    key = f"{o_lat:.6f},{o_lon:.6f}->{d_lat:.6f},{d_lon:.6f}"
-    if key in route_cache:
-        v = route_cache[key]
-        return v["distance_km"], v["duration_min"]
-
-    url = "https://api.openrouteservice.org/v2/directions/driving-car"
     headers = {"Authorization": api_key, "Content-Type": "application/json"}
     body = {"coordinates": [[o_lon, o_lat], [d_lon, d_lat]], "units": "km", "resolve_locations": True}
-
     attempt = 0
     last_err = None
     while attempt <= max_retries:
         try:
-            resp = requests.post(url, headers=headers, data=json.dumps(body), timeout=timeout_s)
+            resp = requests.post(ORS_DIR_URL, headers=headers, data=json.dumps(body), timeout=timeout_s)
             if resp.status_code == 200:
-                distance_km, duration_min = _parse_ors_summary(resp)
-                route_cache[key] = {"distance_km": distance_km, "duration_min": duration_min}
-                return distance_km, duration_min
+                return _parse_ors_summary(resp)
             elif resp.status_code in (429, 503):
                 time.sleep(backoff_s * (attempt + 1))
             else:
-                # will raise with helpful message
                 try:
                     _parse_ors_summary(resp)
                 except Exception as e:
@@ -184,8 +171,50 @@ def get_route_ors(api_key: str,
             last_err = str(e)
         attempt += 1
         time.sleep(backoff_s)
-
     raise RuntimeError(last_err or "Routing failed")
+
+# OSRM public demo server (no key). Use sparingly; has rate limits.
+OSRM_URL = "https://router.project-osrm.org/route/v1/driving/{lon1},{lat1};{lon2},{lat2}?overview=false&annotations=duration,distance"
+
+def route_via_osrm(origin: Tuple[float, float], dest: Tuple[float, float], timeout_s: int = 20) -> Tuple[float, float]:
+    url = OSRM_URL.format(lon1=origin[1], lat1=origin[0], lon2=dest[1], lat2=dest[0])
+    r = requests.get(url, timeout=timeout_s)
+    if r.status_code != 200:
+        raise RuntimeError(f"OSRM HTTP {r.status_code}: {r.text[:160]}")
+    data = r.json()
+    if data.get("code") != "Ok":
+        raise RuntimeError(f"OSRM error: {json.dumps(data)[:160]}")
+    route = data["routes"][0]
+    dist_km = float(route["distance"]) / 1000.0
+    dur_min = float(route["duration"]) / 60.0
+    return dist_km, dur_min
+
+# Unified router with caching and optional fallback
+
+def get_route(api_key: str,
+              origin: Tuple[float, float],
+              dest: Tuple[float, float],
+              provider: str = PROVIDER_ORS,
+              allow_fallback_to_osrm: bool = True,
+              route_cache: Dict[str, Dict[str, float]] | None = None) -> Tuple[float, float]:
+    if route_cache is None:
+        route_cache = {}
+    key = f"{provider}:{origin[0]:.6f},{origin[1]:.6f}->{dest[0]:.6f},{dest[1]:.6f}"
+    if key in route_cache:
+        v = route_cache[key]
+        return v["distance_km"], v["duration_min"]
+    try:
+        if provider == PROVIDER_OSRM:
+            dist_km, dur_min = route_via_osrm(origin, dest)
+        else:
+            dist_km, dur_min = route_via_ors(api_key, origin, dest)
+    except Exception:
+        if provider == PROVIDER_ORS and allow_fallback_to_osrm:
+            dist_km, dur_min = route_via_osrm(origin, dest)
+        else:
+            raise
+    route_cache[key] = {"distance_km": dist_km, "duration_min": dur_min}
+    return dist_km, dur_min
 
 # ---------------------- Validation ----------------------
 
@@ -214,7 +243,9 @@ def process_batch(sites: pd.DataFrame,
                   ref_lon: float,
                   pause_every: int,
                   pause_secs: float,
-                  progress_hook=None) -> Tuple[pd.DataFrame, List[Dict[str, Any]], int]:
+                  progress_hook=None,
+                  provider: str = PROVIDER_ORS,
+                  allow_fallback_to_osrm: bool = True) -> Tuple[pd.DataFrame, List[Dict[str, Any]], int]:
     sites = sites.copy(); airports = airports.copy(); seaports = seaports.copy()
 
     for col in ["Latitude", "Longitude"]:
@@ -273,7 +304,7 @@ def process_batch(sites: pd.DataFrame,
                     if api_calls and pause_every and api_calls % pause_every == 0:
                         if progress_hook: progress_hook(f"Pausing {pause_secs}s to respect rate limits...")
                         time.sleep(pause_secs)
-                    dist_km, dur_min = get_route_ors(api_key, site_origin, dest, route_cache=route_cache)
+                    dist_km, dur_min = get_route(api_key, site_origin, dest, provider=provider, allow_fallback_to_osrm=allow_fallback_to_osrm, route_cache=route_cache)
                     api_calls += 1
                     if dist_km < best_air_d:
                         best_air_d = dist_km; best_air_t = dur_min; best_air = a
@@ -300,7 +331,7 @@ def process_batch(sites: pd.DataFrame,
                     if api_calls and pause_every and api_calls % pause_every == 0:
                         if progress_hook: progress_hook(f"Pausing {pause_secs}s to respect rate limits...")
                         time.sleep(pause_secs)
-                    dist_km, dur_min = get_route_ors(api_key, site_origin, dest, route_cache=route_cache)
+                    dist_km, dur_min = get_route(api_key, site_origin, dest, provider=provider, allow_fallback_to_osrm=allow_fallback_to_osrm, route_cache=route_cache)
                     api_calls += 1
                     if dist_km < best_port_d:
                         best_port_d = dist_km; best_port_t = dur_min; best_port = p
@@ -320,7 +351,7 @@ def process_batch(sites: pd.DataFrame,
                     if api_calls and pause_every and api_calls % pause_every == 0:
                         if progress_hook: progress_hook(f"Pausing {pause_secs}s to respect rate limits...")
                         time.sleep(pause_secs)
-                    dist_km, dur_min = get_route_ors(api_key, site_origin, (ref_lat, ref_lon), route_cache=route_cache)
+                    dist_km, dur_min = get_route(api_key, site_origin, (ref_lat, ref_lon), provider=provider, allow_fallback_to_osrm=allow_fallback_to_osrm, route_cache=route_cache)
                     api_calls += 1
                     out_rec[f"Distance to {DEFAULT_REF['name']} (km)"] = round(dist_km, 1)
                     out_rec[f"Time to {DEFAULT_REF['name']} (min)"] = round(dur_min, 1)
@@ -344,14 +375,17 @@ def sidebar():
     st.sidebar.header("Settings")
 
     st.sidebar.subheader("Routing Provider")
-    api_key = st.sidebar.text_input("OpenRouteService API key", type="password", help="Key is kept in session only.")
+    provider_label = st.sidebar.selectbox("Primary routing engine", ["OpenRouteService (default)", "OSRM (public demo)"])
+    provider = PROVIDER_ORS if provider_label.startswith("OpenRouteService") else PROVIDER_OSRM
+    allow_fb = st.sidebar.checkbox("Auto-fallback to OSRM if primary fails", value=True)
+    api_key = st.sidebar.text_input("OpenRouteService API key", type="password", help="Only needed if ORS is primary.")
 
     st.sidebar.subheader("Top-N Prefilter")
     topn = st.sidebar.number_input("Top-N candidates by Haversine", min_value=1, max_value=20, value=3, step=1)
 
     st.sidebar.subheader("Rate limiting")
     pause_every = st.sidebar.number_input("Pause after X API calls", min_value=0, max_value=500, value=35, step=1,
-                                          help="0 disables pausing. ORS free tier is about 40 req/min.")
+                                          help="0 disables pausing. ORS free tier ~40 req/min.")
     pause_secs = st.sidebar.number_input("Pause duration (seconds)", min_value=0.0, max_value=120.0, value=60.0, step=5.0)
 
     st.sidebar.subheader("Reference location")
@@ -360,12 +394,25 @@ def sidebar():
     ref_lat = st.sidebar.number_input("Reference latitude", value=float(DEFAULT_REF['lat']), format="%.6f")
     ref_lon = st.sidebar.number_input("Reference longitude", value=float(DEFAULT_REF['lon']), format="%.6f")
 
+    st.sidebar.subheader("Connectivity test")
+    if st.sidebar.button("Run quick routing test"):
+        try:
+            # Bedburg to Frankfurt city center as a smoke test
+            o = (DEFAULT_REF['lat'], DEFAULT_REF['lon']); d = (50.1109, 8.6821)
+            if provider == PROVIDER_OSRM:
+                dist_km, dur_min = route_via_osrm(o, d)
+            else:
+                dist_km, dur_min = route_via_ors(api_key, o, d)
+            st.sidebar.success(f"Test OK: {dist_km:.1f} km, {dur_min:.0f} min")
+        except Exception as e:
+            st.sidebar.error(f"Test failed: {e}")
+
     st.sidebar.subheader("Cache")
     if st.sidebar.button("Clear route cache"):
         st.session_state["route_cache"] = {}
         st.sidebar.success("Route cache cleared")
 
-    return api_key, topn, pause_every, pause_secs, use_ref, ref_name, ref_lat, ref_lon
+    return api_key, topn, pause_every, pause_secs, use_ref, ref_name, ref_lat, ref_lon, provider, allow_fb
 
 
 def download_buttons_area():
@@ -464,7 +511,7 @@ def main():
     st.title(APP_TITLE)
     st.caption("Compute road distance/time from sites to nearest airport and container seaport (with Top-N prefilter) and an optional reference location.")
 
-    api_key, topn, pause_every, pause_secs, use_ref, ref_name, ref_lat, ref_lon = sidebar()
+    api_key, topn, pause_every, pause_secs, use_ref, ref_name, ref_lat, ref_lon, provider, allow_fb = sidebar()
 
     download_buttons_area()
 
@@ -473,8 +520,8 @@ def main():
     run = st.button("Run batch")
 
     if run:
-        if api_key == "":
-            st.error("Provide your OpenRouteService API key in the sidebar.")
+        if provider == PROVIDER_ORS and api_key == "":
+            st.error("Provide your OpenRouteService API key in the sidebar (or switch provider to OSRM).")
             return
         if sites_df is None or airports_df is None or seaports_df is None:
             st.error("Upload all three templates with correct columns.")
@@ -500,10 +547,12 @@ def main():
                 pause_every=int(pause_every),
                 pause_secs=float(pause_secs),
                 progress_hook=progress_hook,
+                provider=provider,
+                allow_fallback_to_osrm=allow_fb,
             )
             st.success(f"Completed. API calls: {api_calls}. Cached routes: {len(st.session_state.get('route_cache', {}))}.")
             if api_calls == 0:
-                st.warning("No successful routing calls. Check your ORS key/permissions or quotas. See Processing log below.")
+                st.warning("No successful routing calls. Check your routing provider connectivity/quotas. See Processing log below.")
 
             if use_ref:
                 df_res = df_res.rename(columns={
