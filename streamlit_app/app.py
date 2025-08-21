@@ -11,14 +11,16 @@ import pandas as pd
 import requests
 import streamlit as st
 
+# Try to import UploadedFile for type hints; fall back for older Streamlit builds
 try:
-    from streamlit.runtime.uploaded_file_manager import UploadedFile
+    from streamlit.runtime.uploaded_file_manager import UploadedFile  # type: ignore
 except Exception:
-    from typing import Any as UploadedFile
+    from typing import Any as UploadedFile  # type: ignore
 
+# Optional map dependencies (graceful degrade if unavailable)
 try:
-    from streamlit_folium import st_folium
-    import folium
+    from streamlit_folium import st_folium  # type: ignore
+    import folium  # type: ignore
     _HAS_MAP = True
 except Exception:
     _HAS_MAP = False
@@ -32,6 +34,7 @@ REQUIRED_SEAPORTS_COLS = ["Seaport Name", "Latitude", "Longitude"]
 # ---------------------- Utilities ----------------------
 
 def haversine_km(lat1, lon1, lat2, lon2):
+    """Vectorized haversine distance in km between arrays lat1/lon1 and lat2/lon2."""
     R = 6371.0088
     phi1 = np.radians(lat1)
     phi2 = np.radians(lat2)
@@ -43,7 +46,10 @@ def haversine_km(lat1, lon1, lat2, lon2):
 
 @st.cache_data(show_spinner=False)
 def template_files() -> Dict[str, bytes]:
-    out = {}
+    """Generate the three Excel templates in-memory with example rows."""
+    out: Dict[str, bytes] = {}
+
+    # Sites.xlsx
     df_sites = pd.DataFrame([
         {"Site Name": "Example Plant A", "Latitude": 52.2297, "Longitude": 21.0122},
         {"Site Name": "Example Plant B", "Latitude": 48.1486, "Longitude": 17.1077},
@@ -54,6 +60,7 @@ def template_files() -> Dict[str, bytes]:
         df_sites.to_excel(xw, sheet_name="Sites", index=False)
     out["Sites.xlsx"] = b.getvalue()
 
+    # Airports.xlsx
     df_airports = pd.DataFrame([
         {"Airport Name": "Frankfurt Airport", "IATA": "FRA", "Latitude": 50.0379, "Longitude": 8.5622},
         {"Airport Name": "Warsaw Chopin Airport", "IATA": "WAW", "Latitude": 52.1657, "Longitude": 20.9671},
@@ -66,6 +73,7 @@ def template_files() -> Dict[str, bytes]:
         df_airports.to_excel(xw, sheet_name="Airports", index=False)
     out["Airports.xlsx"] = b.getvalue()
 
+    # Seaports.xlsx
     df_ports = pd.DataFrame([
         {"Seaport Name": "Rotterdam", "UNLOCODE": "", "Latitude": 51.9490, "Longitude": 4.1420},
         {"Seaport Name": "Hamburg", "UNLOCODE": "", "Latitude": 53.5461, "Longitude": 9.9661},
@@ -80,11 +88,15 @@ def template_files() -> Dict[str, bytes]:
 
     return out
 
-# ---------------------- Routing (OSRM default) ----------------------
+# ---------------------- Routing (OSRM public demo) ----------------------
 
-OSRM_URL = "https://router.project-osrm.org/route/v1/driving/{lon1},{lat1};{lon2},{lat2}?overview=false&annotations=duration,distance"
+OSRM_URL = (
+    "https://router.project-osrm.org/route/v1/driving/"
+    "{lon1},{lat1};{lon2},{lat2}?overview=false&annotations=duration,distance"
+)
 
 def route_via_osrm(origin: Tuple[float, float], dest: Tuple[float, float], timeout_s: int = 20) -> Tuple[float, float]:
+    """Call OSRM public demo for driving route; return (km, minutes)."""
     url = OSRM_URL.format(lon1=origin[1], lat1=origin[0], lon2=dest[1], lat2=dest[0])
     r = requests.get(url, timeout=timeout_s)
     if r.status_code != 200:
@@ -101,10 +113,8 @@ def route_via_osrm(origin: Tuple[float, float], dest: Tuple[float, float], timeo
 def _route_key(origin: Tuple[float, float], dest: Tuple[float, float]) -> str:
     return f"OSRM:{origin[0]:.6f},{origin[1]:.6f}->{dest[0]:.6f},{dest[1]:.6f}"
 
-def get_route(api_key: str,
-              origin: Tuple[float, float],
-              dest: Tuple[float, float],
-              route_cache: Dict[str, Dict[str, float]] | None = None) -> Tuple[float, float]:
+def get_route(origin: Tuple[float, float], dest: Tuple[float, float], route_cache: Dict[str, Dict[str, float]] | None = None) -> Tuple[float, float]:
+    """Memoized routing wrapper for OSRM."""
     if route_cache is None:
         route_cache = {}
     key = _route_key(origin, dest)
@@ -115,56 +125,34 @@ def get_route(api_key: str,
     route_cache[key] = {"distance_km": dist_km, "duration_min": dur_min}
     return dist_km, dur_min
 
-# ---------------------- Google Places (autocomplete + details) ----------------------
+# ---------------------- OpenStreetMap (Nominatim) search ----------------------
 
-PLACES_AUTOCOMPLETE = "https://maps.googleapis.com/maps/api/place/autocomplete/json"
-PLACES_DETAILS = "https://maps.googleapis.com/maps/api/place/details/json"
-
-@st.cache_data(show_spinner=False)
-def g_places_autocomplete(query: str, api_key: str, session_token: str = "st_session") -> List[Dict[str, str]]:
-    if not api_key or not query:
-        return []
-    params = {
-        "input": query,
-        "key": api_key,
-        "types": "geocode",
-        # optional: bias to Europe to reduce noise
-        # "components": "country:pl|country:de|country:cz|country:sk|country:hu|country:at|country:ro|country:bg|country:si|country:hr|country:it|country:fr|country:es|country:pt|country:nl|country:be|country:lu|country:lt|country:lv|country:ee|country:dk|country:ie|country:gb",
-        "sessiontoken": session_token,
-    }
-    try:
-        r = requests.get(PLACES_AUTOCOMPLETE, params=params, timeout=12)
-        data = r.json()
-        preds = data.get("predictions", [])
-        return [{"description": p.get("description", ""), "place_id": p.get("place_id", "")} for p in preds]
-    except Exception:
-        return []
+NOMINATIM_SEARCH = "https://nominatim.openstreetmap.org/search"
 
 @st.cache_data(show_spinner=False)
-def g_places_details(place_id: str, api_key: str, session_token: str = "st_session") -> Dict[str, Any]:
-    if not api_key or not place_id:
-        return {}
-    params = {
-        "place_id": place_id,
-        "key": api_key,
-        "fields": "geometry,formatted_address,name",
-        "sessiontoken": session_token,
-    }
+def osm_search(query: str, limit: int = 5) -> List[Dict[str, Any]]:
+    """Free, keyless place search via Nominatim. Returns list of dicts with display_name, lat, lon."""
+    if not query:
+        return []
+    params = {"q": query, "format": "json", "addressdetails": 1, "limit": limit}
+    headers = {"User-Agent": "RoadDistanceFinder/1.0 (contact: example@example.com)"}
     try:
-        r = requests.get(PLACES_DETAILS, params=params, timeout=12)
-        data = r.json()
-        result = data.get("result", {})
-        if "geometry" in result and "location" in result["geometry"]:
-            loc = result["geometry"]["location"]
-            return {
-                "name": result.get("name") or result.get("formatted_address") or "Reference",
-                "address": result.get("formatted_address", ""),
-                "lat": float(loc.get("lat")),
-                "lon": float(loc.get("lng")),
-            }
-        return {}
+        r = requests.get(NOMINATIM_SEARCH, params=params, headers=headers, timeout=12)
+        r.raise_for_status()
+        results = r.json()
+        out: List[Dict[str, Any]] = []
+        for res in results:
+            try:
+                out.append({
+                    "display_name": str(res.get("display_name", "")),
+                    "lat": float(res.get("lat")),
+                    "lon": float(res.get("lon")),
+                })
+            except Exception:
+                continue
+        return out
     except Exception:
-        return {}
+        return []
 
 # ---------------------- Validation ----------------------
 
@@ -184,19 +172,22 @@ def _validate_latlon(lat: pd.Series, lon: pd.Series) -> str:
 
 # ---------------------- Processing ----------------------
 
-def process_batch(sites: pd.DataFrame,
-                  airports: pd.DataFrame,
-                  seaports: pd.DataFrame,
-                  api_key: str,
-                  topn: int,
-                  include_ref: bool,
-                  ref_lat: float,
-                  ref_lon: float,
-                  pause_every: int,
-                  pause_secs: float,
-                  progress_hook=None) -> Tuple[pd.DataFrame, List[Dict[str, Any]], int]:
+def process_batch(
+    sites: pd.DataFrame,
+    airports: pd.DataFrame,
+    seaports: pd.DataFrame,
+    topn: int,
+    include_ref: bool,
+    ref_lat: float,
+    ref_lon: float,
+    pause_every: int,
+    pause_secs: float,
+    progress_hook=None,
+) -> Tuple[pd.DataFrame, List[Dict[str, Any]], int]:
+    """Compute for each site: nearest-by-road airport & seaport after Top-N Haversine prefilter, and optional ref distance."""
     sites = sites.copy(); airports = airports.copy(); seaports = seaports.copy()
 
+    # Coerce numeric
     for col in ["Latitude", "Longitude"]:
         sites[col] = pd.to_numeric(sites[col], errors="coerce")
         airports[col] = pd.to_numeric(airports[col], errors="coerce")
@@ -213,7 +204,7 @@ def process_batch(sites: pd.DataFrame,
 
     route_cache = st.session_state.get("route_cache", {})
 
-    results = []
+    results: List[Dict[str, Any]] = []
     logs: List[Dict[str, Any]] = []
     api_calls = 0
 
@@ -240,6 +231,7 @@ def process_batch(sites: pd.DataFrame,
             out_rec[f"Time to {DEFAULT_REF['name']} (min)"] = None
 
         try:
+            # Airports: Haversine Top-N
             dists_a = haversine_km(slat, slon, a_lat, a_lon)
             idxs_a = np.argsort(dists_a)[: min(topn, len(airports))]
             cand_airports = airports.iloc[idxs_a].copy()
@@ -252,7 +244,7 @@ def process_batch(sites: pd.DataFrame,
                     if api_calls and pause_every and api_calls % pause_every == 0:
                         if progress_hook: progress_hook(f"Pausing {pause_secs}s to respect rate limits...")
                         time.sleep(pause_secs)
-                    dist_km, dur_min = get_route(api_key, site_origin, dest, route_cache=route_cache)
+                    dist_km, dur_min = get_route(site_origin, dest, route_cache=route_cache)
                     api_calls += 1
                     if dist_km < best_air_d:
                         best_air_d = dist_km; best_air_t = dur_min; best_air = a
@@ -266,6 +258,7 @@ def process_batch(sites: pd.DataFrame,
             else:
                 out_rec["Nearest Airport"] = "ERROR"
 
+            # Seaports: Haversine Top-N
             dists_p = haversine_km(slat, slon, p_lat, p_lon)
             idxs_p = np.argsort(dists_p)[: min(topn, len(seaports))]
             cand_ports = seaports.iloc[idxs_p].copy()
@@ -278,7 +271,7 @@ def process_batch(sites: pd.DataFrame,
                     if api_calls and pause_every and api_calls % pause_every == 0:
                         if progress_hook: progress_hook(f"Pausing {pause_secs}s to respect rate limits...")
                         time.sleep(pause_secs)
-                    dist_km, dur_min = get_route(api_key, site_origin, dest, route_cache=route_cache)
+                    dist_km, dur_min = get_route(site_origin, dest, route_cache=route_cache)
                     api_calls += 1
                     if dist_km < best_port_d:
                         best_port_d = dist_km; best_port_t = dur_min; best_port = p
@@ -292,12 +285,13 @@ def process_batch(sites: pd.DataFrame,
             else:
                 out_rec["Nearest Seaport"] = "ERROR"
 
+            # Reference distance/time
             if include_ref:
                 try:
                     if api_calls and pause_every and api_calls % pause_every == 0:
                         if progress_hook: progress_hook(f"Pausing {pause_secs}s to respect rate limits...")
                         time.sleep(pause_secs)
-                    dist_km, dur_min = get_route(api_key, site_origin, (ref_lat, ref_lon), route_cache=route_cache)
+                    dist_km, dur_min = get_route(site_origin, (ref_lat, ref_lon), route_cache=route_cache)
                     api_calls += 1
                     out_rec[f"Distance to {DEFAULT_REF['name']} (km)"] = round(dist_km, 1)
                     out_rec[f"Time to {DEFAULT_REF['name']} (min)"] = round(dur_min, 1)
@@ -320,29 +314,24 @@ def process_batch(sites: pd.DataFrame,
 def sidebar():
     st.sidebar.header("Settings")
 
-    # Google Places for reference search
-    gkey = st.sidebar.text_input("Google Maps API key (Places)", type="password", help="Used only to search reference location.")
-    ref_search = st.sidebar.text_input("Search reference by name (Google)", value="")
+    # OpenStreetMap reference search (no API key required)
+    ref_search = st.sidebar.text_input("Search reference by name (OpenStreetMap)", value="")
     if st.sidebar.button("Search & select reference") and ref_search.strip():
-        preds = g_places_autocomplete(ref_search.strip(), gkey)
+        preds = osm_search(ref_search.strip(), limit=8)
         if not preds:
-            st.sidebar.warning("No suggestions returned. Check API key or query.")
+            st.sidebar.warning("No suggestions returned.")
         else:
-            labels = [p["description"] for p in preds]
+            labels = [p["display_name"] for p in preds]
             choice = st.sidebar.selectbox("Pick a place", labels, index=0)
             if choice:
-                pid = preds[labels.index(choice)]["place_id"]
-                det = g_places_details(pid, gkey)
-                if det:
-                    st.session_state["ref_name"] = det.get("name") or det.get("address") or DEFAULT_REF["name"]
-                    st.session_state["ref_lat"] = float(det.get("lat"))
-                    st.session_state["ref_lon"] = float(det.get("lon"))
-                    st.sidebar.success(f"Reference set to: {st.session_state['ref_name']}")
-                else:
-                    st.sidebar.error("Could not fetch place details.")
+                det = preds[labels.index(choice)]
+                st.session_state["ref_name"] = det.get("display_name", DEFAULT_REF["name"])
+                st.session_state["ref_lat"] = det.get("lat")
+                st.session_state["ref_lon"] = det.get("lon")
+                st.sidebar.success(f"Reference set to: {st.session_state['ref_name']}")
 
     st.sidebar.subheader("Reference location")
-    use_ref = st.sidebar.checkbox(f"Compute distance to reference", value=True)
+    use_ref = st.sidebar.checkbox("Compute distance to reference", value=True)
     ref_name = st.sidebar.text_input("Reference label", value=st.session_state.get("ref_name", DEFAULT_REF['name']), key="ref_name")
     ref_lat = st.sidebar.number_input("Reference latitude", value=float(st.session_state.get("ref_lat", DEFAULT_REF['lat'])), format="%.6f", key="ref_lat")
     ref_lon = st.sidebar.number_input("Reference longitude", value=float(st.session_state.get("ref_lon", DEFAULT_REF['lon'])), format="%.6f", key="ref_lon")
@@ -369,7 +358,7 @@ def sidebar():
         st.session_state["route_cache"] = {}
         st.sidebar.success("Route cache cleared")
 
-    return gkey, topn, pause_every, pause_secs, use_ref, ref_name, float(st.session_state.get("ref_lat", DEFAULT_REF['lat'])), float(st.session_state.get("ref_lon", DEFAULT_REF['lon']))
+    return topn, pause_every, pause_secs, use_ref, ref_name, float(st.session_state.get("ref_lat", DEFAULT_REF['lat'])), float(st.session_state.get("ref_lon", DEFAULT_REF['lon']))
 
 
 def download_buttons_area():
@@ -462,13 +451,14 @@ def maybe_map(df: pd.DataFrame, airports: pd.DataFrame, seaports: pd.DataFrame):
 
     st_folium(m, height=500, use_container_width=True)
 
+# ---------------------- Main ----------------------
 
 def main():
     st.set_page_config(page_title=APP_TITLE, layout="wide")
     st.title(APP_TITLE)
-    st.caption("Compute road distance/time from sites to nearest airport and container seaport (with Top-N prefilter) and an optional reference location.")
+    st.caption("Compute road distance/time from sites to nearest airport and container seaport (Top-N prefilter) and an optional reference location.")
 
-    gkey, topn, pause_every, pause_secs, use_ref, ref_name, ref_lat, ref_lon = sidebar()
+    topn, pause_every, pause_secs, use_ref, ref_name, ref_lat, ref_lon = sidebar()
 
     download_buttons_area()
 
@@ -485,6 +475,7 @@ def main():
             return
 
         status = st.empty(); pbar = st.progress(0); total = len(sites_df)
+
         def progress_hook(msg: str):
             if "Processed" in msg:
                 parts = msg.split(); done = int(parts[1].split("/")[0]); pbar.progress(min(done/total, 1.0))
@@ -493,11 +484,10 @@ def main():
         try:
             df_res, logs, api_calls = process_batch(
                 sites_df, airports_df, seaports_df,
-                api_key=gkey,  # unused by OSRM; kept for signature compatibility
                 topn=int(topn),
                 include_ref=use_ref,
-                ref_lat=ref_lat,
-                ref_lon=ref_lon,
+                ref_lat=float(ref_lat),
+                ref_lon=float(ref_lon),
                 pause_every=int(pause_every),
                 pause_secs=float(pause_secs),
                 progress_hook=progress_hook,
@@ -506,12 +496,14 @@ def main():
             if api_calls == 0:
                 st.warning("No successful routing calls. See Processing log below.")
 
+            # Rename reference columns to user label if changed
             if use_ref:
                 df_res = df_res.rename(columns={
                     f"Distance to {DEFAULT_REF['name']} (km)": f"Distance to {ref_name} (km)",
                     f"Time to {DEFAULT_REF['name']} (min)": f"Time to {ref_name} (min)",
                 })
 
+            # Order columns
             cols = [
                 "Site Name", "Latitude", "Longitude",
                 "Nearest Airport", "Distance to Airport (km)", "Time to Airport (min)",
@@ -519,7 +511,6 @@ def main():
             ]
             if use_ref:
                 cols += [f"Distance to {ref_name} (km)", f"Time to {ref_name} (min)"]
-
             df_res = df_res[cols]
 
             st.subheader("Results")
@@ -530,9 +521,12 @@ def main():
                 for rec in logs:
                     st.write(f"### {rec['site']}")
                     for step in rec["steps"]:
-                        if "msg" in step: st.write("- " + step["msg"])
-                        if "error" in step: st.error("- " + step["error"])
-                        if "fatal" in step: st.error("FATAL: " + step["fatal"])
+                        if "msg" in step:
+                            st.write("- " + step["msg"])
+                        if "error" in step:
+                            st.error("- " + step["error"])
+                        if "fatal" in step:
+                            st.error("FATAL: " + step["fatal"])
 
             if st.checkbox("Show map preview (optional)"):
                 maybe_map(df_res, airports_df, seaports_df)
