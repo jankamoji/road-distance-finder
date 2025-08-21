@@ -1,8 +1,10 @@
-streamlit==1.37.0
-pandas==2.2.2
-numpy==1.26.4
-requests==2.32.3
-openpyxl==3.1.5
-xlsxwriter==3.2.0
-folium==0.15.1
-streamlit-folium==0.18.0
+# Minimal, unpinned (lets Streamlit Cloud pick Python-3.13-compatible wheels quickly)
+streamlit
+pandas
+numpy
+requests
+openpyxl
+xlsxwriter
+# Optional map preview (comment out if you want even faster startup)
+# folium
+# streamlit-folium
