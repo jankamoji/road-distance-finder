@@ -44,7 +44,6 @@ def haversine_km(lat1, lon1, lat2, lon2):
 
 @st.cache_data(show_spinner=False)
 def template_files() -> Dict[str, bytes]:
-    """Generate Excel templates (as bytes) with example rows."""
     out = {}
     # Sites.xlsx
     df_sites = pd.DataFrame([
@@ -98,9 +97,6 @@ def get_route_ors(api_key: str,
                   backoff_s: float = 2.0,
                   route_cache: Dict[str, Dict[str, float]] = None
                   ) -> Tuple[float, float]:
-    """Call ORS driving-car route between origin (lat,lon) and dest (lat,lon).
-    Returns (distance_km, duration_min). Uses in-session cache.
-    """
     if route_cache is None:
         route_cache = {}
     key = _route_cache_key(origin, dest)
@@ -122,12 +118,11 @@ def get_route_ors(api_key: str,
             if resp.status_code == 200:
                 data = resp.json()
                 summary = data["features"][0]["properties"]["summary"]
-                distance_km = float(summary["distance"])  # already in km due to units="km"
+                distance_km = float(summary["distance"])  # already km
                 duration_min = float(summary["duration"]) / 60.0
                 route_cache[key] = {"distance_km": distance_km, "duration_min": duration_min}
                 return distance_km, duration_min
             elif resp.status_code == 429:
-                # Rate limit - backoff
                 time.sleep(backoff_s * (attempt + 1))
             else:
                 last_err = f"HTTP {resp.status_code}: {resp.text[:200]}"
@@ -142,8 +137,7 @@ def get_route_ors(api_key: str,
 # ---------------------- Validation ----------------------
 
 def _validate_columns(df: pd.DataFrame, required_cols: List[str]) -> List[str]:
-    missing = [c for c in required_cols if c not in df.columns]
-    return missing
+    return [c for c in required_cols if c not in df.columns]
 
 
 def _validate_latlon(lat: pd.Series, lon: pd.Series) -> str:
@@ -169,9 +163,6 @@ def process_batch(sites: pd.DataFrame,
                   pause_every: int,
                   pause_secs: float,
                   progress_hook=None) -> Tuple[pd.DataFrame, List[Dict[str, Any]], int]:
-    """Returns (results_df, logs, api_call_count)"""
-
-    # Clean and coerce types
     sites = sites.copy()
     airports = airports.copy()
     seaports = seaports.copy()
@@ -181,14 +172,12 @@ def process_batch(sites: pd.DataFrame,
         airports[col] = pd.to_numeric(airports[col], errors="coerce")
         seaports[col] = pd.to_numeric(seaports[col], errors="coerce")
 
-    # Validation
     err = _validate_latlon(sites["Latitude"], sites["Longitude"]) or \
           _validate_latlon(airports["Latitude"], airports["Longitude"]) or \
           _validate_latlon(seaports["Latitude"], seaports["Longitude"]) 
     if err:
         raise ValueError(err)
 
-    # Precompute arrays
     a_lat = airports["Latitude"].to_numpy()
     a_lon = airports["Longitude"].to_numpy()
     p_lat = seaports["Latitude"].to_numpy()
@@ -203,7 +192,8 @@ def process_batch(sites: pd.DataFrame,
     total = len(sites)
     for i, row in sites.iterrows():
         site_name = str(row["Site Name"]).strip()
-        slat = float(row["Latitude"]) ; slon = float(row["Longitude"]) 
+        slat = float(row["Latitude"])
+        slon = float(row["Longitude"])
         site_origin = (slat, slon)
 
         log_rec = {"site": site_name, "steps": []}
@@ -223,7 +213,6 @@ def process_batch(sites: pd.DataFrame,
             out_rec[f"Time to {DEFAULT_REF['name']} (min)"] = None
 
         try:
-            # Airports: Haversine preselect
             dists_a = haversine_km(slat, slon, a_lat, a_lon)
             idxs_a = np.argsort(dists_a)[: min(topn, len(airports))]
             cand_airports = airports.iloc[idxs_a].copy()
@@ -255,7 +244,6 @@ def process_batch(sites: pd.DataFrame,
             else:
                 out_rec["Nearest Airport"] = "ERROR"
 
-            # Seaports: Haversine preselect
             dists_p = haversine_km(slat, slon, p_lat, p_lon)
             idxs_p = np.argsort(dists_p)[: min(topn, len(seaports))]
             cand_ports = seaports.iloc[idxs_p].copy()
@@ -287,7 +275,6 @@ def process_batch(sites: pd.DataFrame,
             else:
                 out_rec["Nearest Seaport"] = "ERROR"
 
-            # Reference
             if include_ref:
                 try:
                     if api_calls and pause_every and api_calls % pause_every == 0:
@@ -406,7 +393,7 @@ def results_downloads(df: pd.DataFrame, filename_prefix: str = "results"):
 
 def maybe_map(df: pd.DataFrame, airports: pd.DataFrame, seaports: pd.DataFrame):
     if not _HAS_MAP:
-        st.info("Optional map preview requires streamlit-folium and folium. Add them to requirements.txt.")
+        st.info("Optional map preview requires streamlit-folium and folium. If not installed, the app works without the map.")
         return
     if df.empty:
         return
@@ -415,7 +402,6 @@ def maybe_map(df: pd.DataFrame, airports: pd.DataFrame, seaports: pd.DataFrame):
     mean_lon = df["Longitude"].mean()
     m = folium.Map(location=[mean_lat, mean_lon], zoom_start=5)
 
-    # Add site markers and lines to chosen airport and port
     for _, r in df.iterrows():
         site = [r["Latitude"], r["Longitude"]]
         folium.CircleMarker(site, radius=5, tooltip=r["Site Name"], fill=True).add_to(m)
@@ -529,3 +515,22 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+# ----------------------
+# requirements.txt
+# ----------------------
+# Minimal, unpinned (lets Streamlit Cloud pick Python-3.13-compatible wheels quickly)
+streamlit
+pandas
+numpy
+requests
+openpyxl
+xlsxwriter
+# Optional map preview (comment out if you want even faster startup)
+# folium
+# streamlit-folium
+
+# ----------------------
+# runtime.txt
+# ----------------------
+3.11
