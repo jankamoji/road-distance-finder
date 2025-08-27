@@ -106,39 +106,53 @@ NUTS3_URL = "https://gisco-services.ec.europa.eu/distribution/v2/nuts/geojson/NU
 
 @st.cache_data(show_spinner=False)
 def load_nuts3_index() -> Dict[str, Any]:
-    """Download NUTS3 GeoJSON and build an STRtree. Keep a fast id->props map.
-    Returns {ok, tree, geoms, id2props, count, msg}.
-    """
+    """Download NUTS3 GeoJSON and build an STRtree plus stable index mapping."""
     if not _HAS_SHAPELY:
-        return {"ok": False, "msg": "Shapely not installed", "tree": None, "geoms": [], "id2props": {}, "count": 0}
+        return {
+            "ok": False, "msg": "Shapely not installed",
+            "tree": None, "geoms": [], "props": [], "id2ix": {}, "count": 0
+        }
     try:
         r = requests.get(NUTS3_URL, timeout=60)
         r.raise_for_status()
         gj = r.json()
+
         geoms: List[Any] = []
-        id2props: Dict[int, Dict[str, Any]] = {}
-        count = 0
+        props: List[Dict[str, Any]] = []
+        id2ix: Dict[int, int] = {}
         for feat in gj.get("features", []):
             pr = feat.get("properties", {})
             try:
-                geom = shape(feat.get("geometry"))
-                if geom.is_empty:
+                g = shape(feat.get("geometry"))
+                if g.is_empty:
                     continue
-                geoms.append(geom)
-                id2props[id(geom)] = {
+                ix = len(geoms)
+                geoms.append(g)
+                props.append({
                     "NUTS_ID": pr.get("NUTS_ID"),
                     "NAME_LATN": pr.get("NAME_LATN"),
                     "CNTR_CODE": pr.get("CNTR_CODE"),
-                }
-                count += 1
+                })
+                id2ix[id(g)] = ix
             except Exception:
                 continue
+
         if not geoms:
-            return {"ok": False, "msg": "No geometries parsed", "tree": None, "geoms": [], "id2props": {}, "count": 0}
+            return {
+                "ok": False, "msg": "No geometries parsed",
+                "tree": None, "geoms": [], "props": [], "id2ix": {}, "count": 0
+            }
+
         tree = STRtree(geoms)
-        return {"ok": True, "tree": tree, "geoms": geoms, "id2props": id2props, "count": count, "msg": ""}
+        return {
+            "ok": True, "msg": "", "tree": tree,
+            "geoms": geoms, "props": props, "id2ix": id2ix, "count": len(geoms)
+        }
     except Exception as e:
-        return {"ok": False, "msg": str(e), "tree": None, "geoms": [], "id2props": {}, "count": 0}
+        return {
+            "ok": False, "msg": str(e),
+            "tree": None, "geoms": [], "props": [], "id2ix": {}, "count": 0
+        }
 
 @st.cache_data(show_spinner=False)
 def nuts3_lookup(lat: float, lon: float) -> Dict[str, Any]:
@@ -147,28 +161,16 @@ def nuts3_lookup(lat: float, lon: float) -> Dict[str, Any]:
         return {}
     pt = Point(float(lon), float(lat))
     try:
-        candidates = idx["tree"].query(pt)
-        # Filter by precise topological relation; use covers to include boundary points
-        for geom in candidates:
+        cands = idx["tree"].query(pt)  # returns geometries used to build the tree
+        for g in cands:
             try:
-                if geom.covers(pt):
-                    pr = idx["id2props"].get(id(geom))
-                    if pr:
-                        return pr
-            except Exception:
-                continue
-    except Exception:
-        return {}
-    return {}
-    pt = Point(float(lon), float(lat))
-    try:
-        candidates = idx["tree"].query(pt)
-        # filter by actual contains/intersects
-        for geom in candidates:
-            try:
-                if geom.contains(pt) or geom.intersects(pt):
-                    i = idx["geoms"].index(geom)
-                    return idx["props"][i]
+                # covers() includes boundary points; faster/safer than contains() alone
+                if g.covers(pt):
+                    ix = idx["id2ix"].get(id(g))
+                    if ix is None:
+                        # Fallback in case identity differs (rare)
+                        ix = idx["geoms"].index(g)
+                    return idx["props"][ix]
             except Exception:
                 continue
     except Exception:
