@@ -667,13 +667,14 @@ def main():
                 st.warning("No successful routing calls. See Processing log below.")
 
             # Rename reference columns to user label if changed
+            
             if use_ref:
                 df_res = df_res.rename(columns={
                     f"Distance to {DEFAULT_REF['name']} (km)": f"Distance to {ref_name} (km)",
                     f"Time to {DEFAULT_REF['name']} (min)": f"Time to {ref_name} (min)",
                 })
 
-            # Order columns
+            # Order columns for display
             cols = [
                 "Site Name", "Latitude", "Longitude",
                 "Nearest Airport", "Distance to Airport (km)", "Time to Airport (min)",
@@ -685,7 +686,9 @@ def main():
             ]
             if use_ref:
                 cols += [f"Distance to {ref_name} (km)", f"Time to {ref_name} (min)"]
+
             df_res = df_res[cols]
+
 
             st.subheader("Results")
             st.dataframe(df_res, use_container_width=True)
