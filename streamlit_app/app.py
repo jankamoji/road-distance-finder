@@ -445,12 +445,13 @@ def process_batch(
             # Enrichment
             if enrich_nuts3 and _HAS_SHAPELY:
                 try:
-                    n = nuts3_lookup(slat, slon)
+                    n = nuts3_lookup(lat=slat, lon=slon)
                     if n:
                         out_rec["NUTS3 Code"] = n.get("NUTS_ID")
                         out_rec["NUTS3 Name"] = n.get("NAME_LATN")
                 except Exception as e:
                     log_rec["steps"].append({"error": f"NUTS3 lookup: {e}"})
+
             if enrich_osm_admin:
                 try:
                     adm = osm_reverse(slat, slon)
