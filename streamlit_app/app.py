@@ -410,7 +410,10 @@ def process_batch(
 
         logs.append(log_rec)
         results.append(out_rec)
-        if progress_hook: progress_hook(f"Processed {len(results)}/{total}")
+        if progress_hook:
+            progress_hook(f"Processed {len(results)}/{total}")
+
+    # end for each site
 
     st.session_state["route_cache"] = route_cache
     df_res = pd.DataFrame(results)
