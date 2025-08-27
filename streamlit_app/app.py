@@ -284,49 +284,11 @@ def process_batch(
     enrich_nuts3: bool = ENRICH_DEFAULT_NUTS3,
     enrich_osm_admin: bool = ENRICH_DEFAULT_OSM_ADMIN,
 ) -> Tuple[pd.DataFrame, List[Dict[str, Any]], int]:
-    """Compute for each site: nearest-by-road airport & seaport after Top-N Haversine prefilter,
-    optional ref distance, and optional admin enrichment (NUTS3, OSM reverse)."""
-
-    sites = sites.copy()
-    airports = airports.copy()
-    seaports = seaports.copy()
-
-    # Coerce numeric
-    for col in ["Latitude", "Longitude"]:
-        sites[col] = pd.to_numeric(sites[col], errors="coerce")
-        airports[col] = pd.to_numeric(airports[col], errors="coerce")
-        seaports[col] = pd.to_numeric(seaports[col], errors="coerce")
-
-    # Validate lat/lon
-    err = (
-        _validate_latlon(sites["Latitude"], sites["Longitude"])
-        or _validate_latlon(airports["Latitude"], airports["Longitude"])
-        or _validate_latlon(seaports["Latitude"], seaports["Longitude"])
-    )
-    if err:
-        raise ValueError(err)
-
-    a_lat = airports["Latitude"].to_numpy()
-    a_lon = airports["Longitude"].to_numpy()
-    p_lat = seaports["Latitude"].to_numpy()
-    p_lon = seaports["Longitude"].to_numpy()
-
-    route_cache = st.session_state.get("route_cache", {})
-
-    results: List[Dict[str, Any]] = []
-    logs: List[Dict[str, Any]] = []
-    api_calls = 0
-
-    total = len(sites)
-
-    for _, row in sites.iterrows():
         site_name = str(row["Site Name"]).strip()
-        slat = float(row["Latitude"])
-        slon = float(row["Longitude"])
+        slat = float(row["Latitude"]); slon = float(row["Longitude"]) 
         site_origin = (slat, slon)
 
         log_rec = {"site": site_name, "steps": []}
-
         out_rec: Dict[str, Any] = {
             "Site Name": site_name,
             "Latitude": round(slat, 6),
@@ -337,6 +299,7 @@ def process_batch(
             "Nearest Seaport": None,
             "Distance to Seaport (km)": None,
             "Time to Seaport (min)": None,
+            # Admin enrichment placeholders
             "NUTS3 Code": None,
             "NUTS3 Name": None,
             "Municipality": None,
@@ -346,36 +309,28 @@ def process_batch(
             "Voivodeship": None,
             "Voivodeship Code": None,
         }
-
         if include_ref:
             out_rec[f"Distance to {DEFAULT_REF['name']} (km)"] = None
             out_rec[f"Time to {DEFAULT_REF['name']} (min)"] = None
 
         try:
-            # --- Airports ---
+            # Airports: Haversine Top-N
             dists_a = haversine_km(slat, slon, a_lat, a_lon)
             idxs_a = np.argsort(dists_a)[: min(topn, len(airports))]
             cand_airports = airports.iloc[idxs_a].copy()
-            log_rec["steps"].append(
-                {"msg": f"Top-{len(cand_airports)} airports: {cand_airports['Airport Name'].tolist()}"}
-            )
+            log_rec["steps"].append({"msg": f"Top-{len(cand_airports)} airports: {cand_airports['Airport Name'].tolist()}"})
 
-            best_air = None
-            best_air_d = math.inf
-            best_air_t = math.inf
+            best_air = None; best_air_d = math.inf; best_air_t = math.inf
             for _, a in cand_airports.iterrows():
                 dest = (float(a["Latitude"]), float(a["Longitude"]))
                 try:
                     if api_calls and pause_every and api_calls % pause_every == 0:
-                        if progress_hook:
-                            progress_hook(f"Pausing {pause_secs}s to respect rate limits...")
+                        if progress_hook: progress_hook(f"Pausing {pause_secs}s to respect rate limits...")
                         time.sleep(pause_secs)
                     dist_km, dur_min = get_route(site_origin, dest, route_cache=route_cache)
                     api_calls += 1
                     if dist_km < best_air_d:
-                        best_air_d = dist_km
-                        best_air_t = dur_min
-                        best_air = a
+                        best_air_d = dist_km; best_air_t = dur_min; best_air = a
                 except Exception as e:
                     log_rec["steps"].append({"error": f"Airport '{a['Airport Name']}': {e}"})
 
@@ -386,30 +341,23 @@ def process_batch(
             else:
                 out_rec["Nearest Airport"] = "ERROR"
 
-            # --- Seaports ---
+            # Seaports: Haversine Top-N
             dists_p = haversine_km(slat, slon, p_lat, p_lon)
             idxs_p = np.argsort(dists_p)[: min(topn, len(seaports))]
             cand_ports = seaports.iloc[idxs_p].copy()
-            log_rec["steps"].append(
-                {"msg": f"Top-{len(cand_ports)} seaports: {cand_ports['Seaport Name'].tolist()}"}
-            )
+            log_rec["steps"].append({"msg": f"Top-{len(cand_ports)} seaports: {cand_ports['Seaport Name'].tolist()}"})
 
-            best_port = None
-            best_port_d = math.inf
-            best_port_t = math.inf
+            best_port = None; best_port_d = math.inf; best_port_t = math.inf
             for _, p in cand_ports.iterrows():
                 dest = (float(p["Latitude"]), float(p["Longitude"]))
                 try:
                     if api_calls and pause_every and api_calls % pause_every == 0:
-                        if progress_hook:
-                            progress_hook(f"Pausing {pause_secs}s to respect rate limits...")
+                        if progress_hook: progress_hook(f"Pausing {pause_secs}s to respect rate limits...")
                         time.sleep(pause_secs)
                     dist_km, dur_min = get_route(site_origin, dest, route_cache=route_cache)
                     api_calls += 1
                     if dist_km < best_port_d:
-                        best_port_d = dist_km
-                        best_port_t = dur_min
-                        best_port = p
+                        best_port_d = dist_km; best_port_t = dur_min; best_port = p
                 except Exception as e:
                     log_rec["steps"].append({"error": f"Seaport '{p['Seaport Name']}': {e}"})
 
@@ -420,12 +368,11 @@ def process_batch(
             else:
                 out_rec["Nearest Seaport"] = "ERROR"
 
-            # --- Reference ---
+            # Reference distance/time
             if include_ref:
                 try:
                     if api_calls and pause_every and api_calls % pause_every == 0:
-                        if progress_hook:
-                            progress_hook(f"Pausing {pause_secs}s to respect rate limits...")
+                        if progress_hook: progress_hook(f"Pausing {pause_secs}s to respect rate limits...")
                         time.sleep(pause_secs)
                     dist_km, dur_min = get_route(site_origin, (ref_lat, ref_lon), route_cache=route_cache)
                     api_calls += 1
@@ -434,7 +381,7 @@ def process_batch(
                 except Exception as e:
                     log_rec["steps"].append({"error": f"Reference: {e}"})
 
-            # --- Admin enrichment ---
+            # Admin enrichment
             if enrich_nuts3 and _HAS_SHAPELY:
                 try:
                     n = nuts3_lookup(slat, slon)
@@ -463,14 +410,11 @@ def process_batch(
 
         logs.append(log_rec)
         results.append(out_rec)
-        if progress_hook:
-            progress_hook(f"Processed {len(results)}/{total}")
+        if progress_hook: progress_hook(f"Processed {len(results)}/{total}")
 
-    # after loop
     st.session_state["route_cache"] = route_cache
     df_res = pd.DataFrame(results)
     return df_res, logs, api_calls
-
 
 # ---------------------- UI ----------------------
 
@@ -623,9 +567,22 @@ def maybe_map(df: pd.DataFrame, airports: pd.DataFrame, seaports: pd.DataFrame):
 def main():
     st.set_page_config(page_title=APP_TITLE, layout="wide")
     st.title(APP_TITLE)
-    st.caption("Compute road distance/time from sites to nearest airport and container seaport (Top-N prefilter), optional reference location, and admin enrichment.")
+    st.caption(
+        "Compute road distance/time from sites to nearest airport and container seaport (Top-N prefilter), "
+        "optional reference location, and admin enrichment."
+    )
 
-    topn, pause_every, pause_secs, use_ref, ref_name, ref_lat, ref_lon, enrich_nuts3, enrich_osm_admin = sidebar()
+    (
+        topn,
+        pause_every,
+        pause_secs,
+        use_ref,
+        ref_name,
+        ref_lat,
+        ref_lon,
+        enrich_nuts3,
+        enrich_osm_admin,
+    ) = sidebar()
 
     download_buttons_area()
 
@@ -641,16 +598,25 @@ def main():
             st.error("Uploaded files must contain at least one row in each sheet.")
             return
 
-        status = st.empty(); pbar = st.progress(0); total = len(sites_df)
+        status = st.empty()
+        pbar = st.progress(0)
+        total = len(sites_df)
 
         def progress_hook(msg: str):
             if "Processed" in msg:
-                parts = msg.split(); done = int(parts[1].split("/")[0]); pbar.progress(min(done/total, 1.0))
+                parts = msg.split()
+                try:
+                    done = int(parts[1].split("/")[0])
+                    pbar.progress(min(done / max(total, 1), 1.0))
+                except Exception:
+                    pass
             status.info(msg)
 
         try:
             df_res, logs, api_calls = process_batch(
-                sites_df, airports_df, seaports_df,
+                sites_df,
+                airports_df,
+                seaports_df,
                 topn=int(topn),
                 include_ref=use_ref,
                 ref_lat=float(ref_lat),
@@ -661,34 +627,48 @@ def main():
                 enrich_nuts3=enrich_nuts3,
                 enrich_osm_admin=enrich_osm_admin,
             )
+
+            st.success(
+                f"Completed. API calls: {api_calls}. Cached routes: {len(st.session_state.get('route_cache', {}))}."
             )
-            st.success(f"Completed. API calls: {api_calls}. Cached routes: {len(st.session_state.get('route_cache', {}))}.")
             if api_calls == 0:
                 st.warning("No successful routing calls. See Processing log below.")
 
             # Rename reference columns to user label if changed
-            
             if use_ref:
-                df_res = df_res.rename(columns={
-                    f"Distance to {DEFAULT_REF['name']} (km)": f"Distance to {ref_name} (km)",
-                    f"Time to {DEFAULT_REF['name']} (min)": f"Time to {ref_name} (min)",
-                })
+                df_res = df_res.rename(
+                    columns={
+                        f"Distance to {DEFAULT_REF['name']} (km)": f"Distance to {ref_name} (km)",
+                        f"Time to {DEFAULT_REF['name']} (min)": f"Time to {ref_name} (min)",
+                    }
+                )
 
             # Order columns for display
             cols = [
-                "Site Name", "Latitude", "Longitude",
-                "Nearest Airport", "Distance to Airport (km)", "Time to Airport (min)",
-                "Nearest Seaport", "Distance to Seaport (km)", "Time to Seaport (min)",
-                "NUTS3 Code", "NUTS3 Name",
-                "Municipality", "Municipality Code",
-                "County", "County Code",
-                "Voivodeship", "Voivodeship Code",
+                "Site Name",
+                "Latitude",
+                "Longitude",
+                "Nearest Airport",
+                "Distance to Airport (km)",
+                "Time to Airport (min)",
+                "Nearest Seaport",
+                "Distance to Seaport (km)",
+                "Time to Seaport (min)",
+                "NUTS3 Code",
+                "NUTS3 Name",
+                "Municipality",
+                "Municipality Code",
+                "County",
+                "County Code",
+                "Voivodeship",
+                "Voivodeship Code",
             ]
             if use_ref:
                 cols += [f"Distance to {ref_name} (km)", f"Time to {ref_name} (min)"]
 
+            # Only keep columns that exist (defensive)
+            cols = [c for c in cols if c in df_res.columns]
             df_res = df_res[cols]
-
 
             st.subheader("Results")
             st.dataframe(df_res, use_container_width=True)
@@ -708,15 +688,15 @@ def main():
             if st.checkbox("Show map preview (optional)"):
                 maybe_map(df_res, airports_df, seaports_df)
 
-            # Small hints
             if enrich_nuts3 and not _HAS_SHAPELY:
-                st.warning("NUTS3 enrichment requested but Shapely is not installed. Add 'shapely>=2.0' to requirements.txt.")("Show map preview (optional)"):
-                maybe_map(df_res, airports_df, seaports_df)
+                st.warning(
+                    "NUTS3 enrichment requested but Shapely is not installed. Add 'shapely>=2.0' to requirements.txt."
+                )
 
         except Exception as e:
             st.error(f"Processing failed: {e}")
             st.exception(e)
 
-
 if __name__ == "__main__":
+ "__main__":
     main()
