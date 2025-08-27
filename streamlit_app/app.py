@@ -31,10 +31,6 @@ REQUIRED_SITES_COLS = ["Site Name", "Latitude", "Longitude"]
 REQUIRED_AIRPORTS_COLS = ["Airport Name", "Latitude", "Longitude"]
 REQUIRED_SEAPORTS_COLS = ["Seaport Name", "Latitude", "Longitude"]
 
-# Admin enrichment toggles (defaults)
-ENRICH_DEFAULT_NUTS3 = True
-ENRICH_DEFAULT_OSM_ADMIN = True
-
 # ---------------------- Utilities ----------------------
 
 def haversine_km(lat1, lon1, lat2, lon2):
@@ -106,53 +102,39 @@ NUTS3_URL = "https://gisco-services.ec.europa.eu/distribution/v2/nuts/geojson/NU
 
 @st.cache_data(show_spinner=False)
 def load_nuts3_index() -> Dict[str, Any]:
-    """Download NUTS3 GeoJSON and build an STRtree plus stable index mapping."""
+    """Download NUTS3 GeoJSON and build an STRtree. Keep a fast id->props map.
+    Returns {ok, tree, geoms, id2props, count, msg}.
+    """
     if not _HAS_SHAPELY:
-        return {
-            "ok": False, "msg": "Shapely not installed",
-            "tree": None, "geoms": [], "props": [], "id2ix": {}, "count": 0
-        }
+        return {"ok": False, "msg": "Shapely not installed", "tree": None, "geoms": [], "id2props": {}, "count": 0}
     try:
         r = requests.get(NUTS3_URL, timeout=60)
         r.raise_for_status()
         gj = r.json()
-
         geoms: List[Any] = []
-        props: List[Dict[str, Any]] = []
-        id2ix: Dict[int, int] = {}
+        id2props: Dict[int, Dict[str, Any]] = {}
+        count = 0
         for feat in gj.get("features", []):
             pr = feat.get("properties", {})
             try:
-                g = shape(feat.get("geometry"))
-                if g.is_empty:
+                geom = shape(feat.get("geometry"))
+                if geom.is_empty:
                     continue
-                ix = len(geoms)
-                geoms.append(g)
-                props.append({
+                geoms.append(geom)
+                id2props[id(geom)] = {
                     "NUTS_ID": pr.get("NUTS_ID"),
                     "NAME_LATN": pr.get("NAME_LATN"),
                     "CNTR_CODE": pr.get("CNTR_CODE"),
-                })
-                id2ix[id(g)] = ix
+                }
+                count += 1
             except Exception:
                 continue
-
         if not geoms:
-            return {
-                "ok": False, "msg": "No geometries parsed",
-                "tree": None, "geoms": [], "props": [], "id2ix": {}, "count": 0
-            }
-
+            return {"ok": False, "msg": "No geometries parsed", "tree": None, "geoms": [], "id2props": {}, "count": 0}
         tree = STRtree(geoms)
-        return {
-            "ok": True, "msg": "", "tree": tree,
-            "geoms": geoms, "props": props, "id2ix": id2ix, "count": len(geoms)
-        }
+        return {"ok": True, "tree": tree, "geoms": geoms, "id2props": id2props, "count": count, "msg": ""}
     except Exception as e:
-        return {
-            "ok": False, "msg": str(e),
-            "tree": None, "geoms": [], "props": [], "id2ix": {}, "count": 0
-        }
+        return {"ok": False, "msg": str(e), "tree": None, "geoms": [], "id2props": {}, "count": 0}
 
 @st.cache_data(show_spinner=False)
 def nuts3_lookup(lat: float, lon: float) -> Dict[str, Any]:
@@ -161,16 +143,28 @@ def nuts3_lookup(lat: float, lon: float) -> Dict[str, Any]:
         return {}
     pt = Point(float(lon), float(lat))
     try:
-        cands = idx["tree"].query(pt)  # returns geometries used to build the tree
-        for g in cands:
+        candidates = idx["tree"].query(pt)
+        # Filter by precise topological relation; use covers to include boundary points
+        for geom in candidates:
             try:
-                # covers() includes boundary points; faster/safer than contains() alone
-                if g.covers(pt):
-                    ix = idx["id2ix"].get(id(g))
-                    if ix is None:
-                        # Fallback in case identity differs (rare)
-                        ix = idx["geoms"].index(g)
-                    return idx["props"][ix]
+                if geom.covers(pt):
+                    pr = idx["id2props"].get(id(geom))
+                    if pr:
+                        return pr
+            except Exception:
+                continue
+    except Exception:
+        return {}
+    return {}
+    pt = Point(float(lon), float(lat))
+    try:
+        candidates = idx["tree"].query(pt)
+        # filter by actual contains/intersects
+        for geom in candidates:
+            try:
+                if geom.contains(pt) or geom.intersects(pt):
+                    i = idx["geoms"].index(geom)
+                    return idx["props"][i]
             except Exception:
                 continue
     except Exception:
@@ -314,43 +308,8 @@ def process_batch(
     enrich_nuts3: bool = ENRICH_DEFAULT_NUTS3,
     enrich_osm_admin: bool = ENRICH_DEFAULT_OSM_ADMIN,
 ) -> Tuple[pd.DataFrame, List[Dict[str, Any]], int]:
-    """Compute nearest airport, seaport, optional reference, and admin enrichment for each site."""
-
-    sites = sites.copy()
-    airports = airports.copy()
-    seaports = seaports.copy()
-
-    # Coerce numeric
-    for col in ["Latitude", "Longitude"]:
-        sites[col] = pd.to_numeric(sites[col], errors="coerce")
-        airports[col] = pd.to_numeric(airports[col], errors="coerce")
-        seaports[col] = pd.to_numeric(seaports[col], errors="coerce")
-
-    # Validate lat/lon
-    err = (
-        _validate_latlon(sites["Latitude"], sites["Longitude"])
-        or _validate_latlon(airports["Latitude"], airports["Longitude"])
-        or _validate_latlon(seaports["Latitude"], seaports["Longitude"])
-    )
-    if err:
-        raise ValueError(err)
-
-    a_lat = airports["Latitude"].to_numpy()
-    a_lon = airports["Longitude"].to_numpy()
-    p_lat = seaports["Latitude"].to_numpy()
-    p_lon = seaports["Longitude"].to_numpy()
-
-    route_cache = st.session_state.get("route_cache", {})
-
-    results: List[Dict[str, Any]] = []
-    logs: List[Dict[str, Any]] = []
-    api_calls = 0
-    total = len(sites)
-
-    for _, row in sites.iterrows():
         site_name = str(row["Site Name"]).strip()
-        slat = float(row["Latitude"])
-        slon = float(row["Longitude"])
+        slat = float(row["Latitude"]); slon = float(row["Longitude"]) 
         site_origin = (slat, slon)
 
         log_rec = {"site": site_name, "steps": []}
@@ -364,6 +323,7 @@ def process_batch(
             "Nearest Seaport": None,
             "Distance to Seaport (km)": None,
             "Time to Seaport (min)": None,
+            # Admin enrichment placeholders
             "NUTS3 Code": None,
             "NUTS3 Name": None,
             "Municipality": None,
@@ -378,62 +338,65 @@ def process_batch(
             out_rec[f"Time to {DEFAULT_REF['name']} (min)"] = None
 
         try:
-            # Airports
+            # Airports: Haversine Top-N
             dists_a = haversine_km(slat, slon, a_lat, a_lon)
             idxs_a = np.argsort(dists_a)[: min(topn, len(airports))]
             cand_airports = airports.iloc[idxs_a].copy()
             log_rec["steps"].append({"msg": f"Top-{len(cand_airports)} airports: {cand_airports['Airport Name'].tolist()}"})
 
-            best_air, best_air_d, best_air_t = None, math.inf, math.inf
+            best_air = None; best_air_d = math.inf; best_air_t = math.inf
             for _, a in cand_airports.iterrows():
                 dest = (float(a["Latitude"]), float(a["Longitude"]))
                 try:
                     if api_calls and pause_every and api_calls % pause_every == 0:
-                        if progress_hook:
-                            progress_hook(f"Pausing {pause_secs}s to respect rate limits...")
+                        if progress_hook: progress_hook(f"Pausing {pause_secs}s to respect rate limits...")
                         time.sleep(pause_secs)
                     dist_km, dur_min = get_route(site_origin, dest, route_cache=route_cache)
                     api_calls += 1
                     if dist_km < best_air_d:
-                        best_air, best_air_d, best_air_t = a, dist_km, dur_min
+                        best_air_d = dist_km; best_air_t = dur_min; best_air = a
                 except Exception as e:
                     log_rec["steps"].append({"error": f"Airport '{a['Airport Name']}': {e}"})
+
             if best_air is not None:
                 out_rec["Nearest Airport"] = str(best_air.get("Airport Name"))
                 out_rec["Distance to Airport (km)"] = round(best_air_d, 1)
                 out_rec["Time to Airport (min)"] = round(best_air_t, 1)
+            else:
+                out_rec["Nearest Airport"] = "ERROR"
 
-            # Seaports
+            # Seaports: Haversine Top-N
             dists_p = haversine_km(slat, slon, p_lat, p_lon)
             idxs_p = np.argsort(dists_p)[: min(topn, len(seaports))]
             cand_ports = seaports.iloc[idxs_p].copy()
             log_rec["steps"].append({"msg": f"Top-{len(cand_ports)} seaports: {cand_ports['Seaport Name'].tolist()}"})
 
-            best_port, best_port_d, best_port_t = None, math.inf, math.inf
+            best_port = None; best_port_d = math.inf; best_port_t = math.inf
             for _, p in cand_ports.iterrows():
                 dest = (float(p["Latitude"]), float(p["Longitude"]))
                 try:
                     if api_calls and pause_every and api_calls % pause_every == 0:
-                        if progress_hook:
-                            progress_hook(f"Pausing {pause_secs}s to respect rate limits...")
+                        if progress_hook: progress_hook(f"Pausing {pause_secs}s to respect rate limits...")
                         time.sleep(pause_secs)
                     dist_km, dur_min = get_route(site_origin, dest, route_cache=route_cache)
                     api_calls += 1
                     if dist_km < best_port_d:
-                        best_port, best_port_d, best_port_t = p, dist_km, dur_min
+                        best_port_d = dist_km; best_port_t = dur_min; best_port = p
                 except Exception as e:
                     log_rec["steps"].append({"error": f"Seaport '{p['Seaport Name']}': {e}"})
+
             if best_port is not None:
                 out_rec["Nearest Seaport"] = str(best_port.get("Seaport Name"))
                 out_rec["Distance to Seaport (km)"] = round(best_port_d, 1)
                 out_rec["Time to Seaport (min)"] = round(best_port_t, 1)
+            else:
+                out_rec["Nearest Seaport"] = "ERROR"
 
-            # Reference
+            # Reference distance/time
             if include_ref:
                 try:
                     if api_calls and pause_every and api_calls % pause_every == 0:
-                        if progress_hook:
-                            progress_hook(f"Pausing {pause_secs}s to respect rate limits...")
+                        if progress_hook: progress_hook(f"Pausing {pause_secs}s to respect rate limits...")
                         time.sleep(pause_secs)
                     dist_km, dur_min = get_route(site_origin, (ref_lat, ref_lon), route_cache=route_cache)
                     api_calls += 1
@@ -442,15 +405,17 @@ def process_batch(
                 except Exception as e:
                     log_rec["steps"].append({"error": f"Reference: {e}"})
 
-            # Enrichment
+            # Admin enrichment
             if enrich_nuts3 and _HAS_SHAPELY:
                 try:
-                    n = nuts3_lookup(lat=slat, lon=slon)
+                    n = nuts3_lookup(slat, slon)
                     if n:
                         out_rec["NUTS3 Code"] = n.get("NUTS_ID")
                         out_rec["NUTS3 Name"] = n.get("NAME_LATN")
                 except Exception as e:
                     log_rec["steps"].append({"error": f"NUTS3 lookup: {e}"})
+            elif enrich_nuts3 and not _HAS_SHAPELY:
+                log_rec["steps"].append({"error": "NUTS3 lookup skipped: shapely not installed"})
 
             if enrich_osm_admin:
                 try:
@@ -463,15 +428,14 @@ def process_batch(
                     out_rec["Voivodeship Code"] = adm.get("voivodeship_code") or None
                 except Exception as e:
                     log_rec["steps"].append({"error": f"OSM admin reverse: {e}"})
+
         except Exception as e:
             log_rec["steps"].append({"fatal": str(e)})
 
         logs.append(log_rec)
         results.append(out_rec)
-        if progress_hook:
-            progress_hook(f"Processed {len(results)}/{total}")
+        if progress_hook: progress_hook(f"Processed {len(results)}/{total}")
 
-    # After loop
     st.session_state["route_cache"] = route_cache
     df_res = pd.DataFrame(results)
     return df_res, logs, api_calls
@@ -770,5 +734,5 @@ def main():
             st.exception(e)
 
 if __name__ == "__main__":
+ "__main__":
     main()
-
