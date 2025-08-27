@@ -88,7 +88,105 @@ def template_files() -> Dict[str, bytes]:
 
     return out
 
-# ---------------------- Routing (OSRM public demo) ----------------------
+# ---------------------- NUTS 3 lookup (EU GISCO) ----------------------
+
+# Lightweight point-in-polygon using shapely STRtree; no geopandas dependency.
+try:
+    from shapely.geometry import shape, Point  # type: ignore
+    from shapely.strtree import STRtree  # shapely >= 2.0
+    _HAS_SHAPELY = True
+except Exception:
+    _HAS_SHAPELY = False
+
+NUTS3_URL = "https://gisco-services.ec.europa.eu/distribution/v2/nuts/geojson/NUTS_RG_01M_2021_4326_LEVL_3.geojson"
+
+@st.cache_data(show_spinner=False)
+def load_nuts3_index() -> Dict[str, Any]:
+    if not _HAS_SHAPELY:
+        return {"ok": False, "msg": "Shapely not installed", "tree": None, "geoms": [], "props": []}
+    try:
+        r = requests.get(NUTS3_URL, timeout=40)
+        r.raise_for_status()
+        gj = r.json()
+        geoms = []
+        props = []
+        for feat in gj.get("features", []):
+            try:
+                geom = shape(feat.get("geometry"))
+                pr = feat.get("properties", {})
+                geoms.append(geom)
+                props.append({
+                    "NUTS_ID": pr.get("NUTS_ID"),
+                    "NAME_LATN": pr.get("NAME_LATN"),
+                    "CNTR_CODE": pr.get("CNTR_CODE"),
+                })
+            except Exception:
+                continue
+        tree = STRtree(geoms)
+        return {"ok": True, "tree": tree, "geoms": geoms, "props": props}
+    except Exception as e:
+        return {"ok": False, "msg": str(e), "tree": None, "geoms": [], "props": []}
+
+@st.cache_data(show_spinner=False)
+def nuts3_lookup(lat: float, lon: float) -> Dict[str, Any]:
+    idx = load_nuts3_index()
+    if not idx.get("ok"):
+        return {}
+    pt = Point(float(lon), float(lat))
+    try:
+        candidates = idx["tree"].query(pt)
+        # filter by actual contains/intersects
+        for geom in candidates:
+            try:
+                if geom.contains(pt) or geom.intersects(pt):
+                    i = idx["geoms"].index(geom)
+                    return idx["props"][i]
+            except Exception:
+                continue
+    except Exception:
+        return {}
+    return {}
+
+# ---------------------- OSM Reverse Geocoding (admin levels) ----------------------
+
+NOMINATIM_REVERSE = "https://nominatim.openstreetmap.org/reverse"
+
+@st.cache_data(show_spinner=False)
+def osm_reverse(lat: float, lon: float) -> Dict[str, Any]:
+    params = {
+        "format": "jsonv2",
+        "lat": float(lat),
+        "lon": float(lon),
+        "addressdetails": 1,
+        "extratags": 1,
+    }
+    headers = {"User-Agent": "RoadDistanceFinder/1.0 (contact: example@example.com)"}
+    try:
+        r = requests.get(NOMINATIM_REVERSE, params=params, headers=headers, timeout=12)
+        r.raise_for_status()
+        data = r.json()
+        addr = data.get("address", {})
+        ex = data.get("extratags", {})
+        # Best-effort extraction across Europe; for PL this maps to gmina/powiat/województwo
+        municipality = addr.get("municipality") or addr.get("city") or addr.get("town") or addr.get("village") or addr.get("suburb")
+        county = addr.get("county") or addr.get("state_district")
+        voivodeship = addr.get("state")
+        # Codes (if present). Nominatim sometimes exposes ISO3166-2 codes per level and OSM tags.
+        muni_code = ex.get("ref:teryt:simc") or ex.get("ref:teryt") or ""
+        county_code = ex.get("ref:teryt:powiat") or ""
+        voiv_code = ex.get("ref:teryt:wojewodztwo") or addr.get("ISO3166-2-lvl4") or ""
+        return {
+            "municipality": municipality or "",
+            "municipality_code": muni_code,
+            "county": county or "",
+            "county_code": county_code,
+            "voivodeship": voivodeship or "",
+            "voivodeship_code": voiv_code,
+        }
+    except Exception:
+        return {"municipality": "", "municipality_code": "", "county": "", "county_code": "", "voivodeship": "", "voivodeship_code": ""}
+
+# ---------------------- Routing (OSRM public demo) ----------------------  
 
 OSRM_URL = (
     "https://router.project-osrm.org/route/v1/driving/"
@@ -125,7 +223,7 @@ def get_route(origin: Tuple[float, float], dest: Tuple[float, float], route_cach
     route_cache[key] = {"distance_km": dist_km, "duration_min": dur_min}
     return dist_km, dur_min
 
-# ---------------------- OpenStreetMap (Nominatim) search ----------------------
+# ---------------------- OpenStreetMap (Nominatim) search ----------------------  
 
 NOMINATIM_SEARCH = "https://nominatim.openstreetmap.org/search"
 
@@ -183,33 +281,9 @@ def process_batch(
     pause_every: int,
     pause_secs: float,
     progress_hook=None,
+    enrich_nuts3: bool = ENRICH_DEFAULT_NUTS3,
+    enrich_osm_admin: bool = ENRICH_DEFAULT_OSM_ADMIN,
 ) -> Tuple[pd.DataFrame, List[Dict[str, Any]], int]:
-    """Compute for each site: nearest-by-road airport & seaport after Top-N Haversine prefilter, and optional ref distance."""
-    sites = sites.copy(); airports = airports.copy(); seaports = seaports.copy()
-
-    # Coerce numeric
-    for col in ["Latitude", "Longitude"]:
-        sites[col] = pd.to_numeric(sites[col], errors="coerce")
-        airports[col] = pd.to_numeric(airports[col], errors="coerce")
-        seaports[col] = pd.to_numeric(seaports[col], errors="coerce")
-
-    err = _validate_latlon(sites["Latitude"], sites["Longitude"]) or \
-          _validate_latlon(airports["Latitude"], airports["Longitude"]) or \
-          _validate_latlon(seaports["Latitude"], seaports["Longitude"]) 
-    if err:
-        raise ValueError(err)
-
-    a_lat = airports["Latitude"].to_numpy(); a_lon = airports["Longitude"].to_numpy()
-    p_lat = seaports["Latitude"].to_numpy(); p_lon = seaports["Longitude"].to_numpy()
-
-    route_cache = st.session_state.get("route_cache", {})
-
-    results: List[Dict[str, Any]] = []
-    logs: List[Dict[str, Any]] = []
-    api_calls = 0
-
-    total = len(sites)
-    for _, row in sites.iterrows():
         site_name = str(row["Site Name"]).strip()
         slat = float(row["Latitude"]); slon = float(row["Longitude"]) 
         site_origin = (slat, slon)
@@ -225,6 +299,15 @@ def process_batch(
             "Nearest Seaport": None,
             "Distance to Seaport (km)": None,
             "Time to Seaport (min)": None,
+            # Admin enrichment placeholders
+            "NUTS3 Code": None,
+            "NUTS3 Name": None,
+            "Municipality": None,
+            "Municipality Code": None,
+            "County": None,
+            "County Code": None,
+            "Voivodeship": None,
+            "Voivodeship Code": None,
         }
         if include_ref:
             out_rec[f"Distance to {DEFAULT_REF['name']} (km)"] = None
@@ -298,6 +381,30 @@ def process_batch(
                 except Exception as e:
                     log_rec["steps"].append({"error": f"Reference: {e}"})
 
+            # Admin enrichment
+            if enrich_nuts3 and _HAS_SHAPELY:
+                try:
+                    n = nuts3_lookup(slat, slon)
+                    if n:
+                        out_rec["NUTS3 Code"] = n.get("NUTS_ID")
+                        out_rec["NUTS3 Name"] = n.get("NAME_LATN")
+                except Exception as e:
+                    log_rec["steps"].append({"error": f"NUTS3 lookup: {e}"})
+            elif enrich_nuts3 and not _HAS_SHAPELY:
+                log_rec["steps"].append({"error": "NUTS3 lookup skipped: shapely not installed"})
+
+            if enrich_osm_admin:
+                try:
+                    adm = osm_reverse(slat, slon)
+                    out_rec["Municipality"] = adm.get("municipality") or None
+                    out_rec["Municipality Code"] = adm.get("municipality_code") or None
+                    out_rec["County"] = adm.get("county") or None
+                    out_rec["County Code"] = adm.get("county_code") or None
+                    out_rec["Voivodeship"] = adm.get("voivodeship") or None
+                    out_rec["Voivodeship Code"] = adm.get("voivodeship_code") or None
+                except Exception as e:
+                    log_rec["steps"].append({"error": f"OSM admin reverse: {e}"})
+
         except Exception as e:
             log_rec["steps"].append({"fatal": str(e)})
 
@@ -339,6 +446,10 @@ def sidebar():
     st.sidebar.subheader("Top-N Prefilter")
     topn = st.sidebar.number_input("Top-N candidates by Haversine", min_value=1, max_value=20, value=3, step=1)
 
+    st.sidebar.subheader("Admin enrichment")
+    enrich_nuts3 = st.sidebar.checkbox("Add NUTS-3 (EU GISCO)", value=ENRICH_DEFAULT_NUTS3)
+    enrich_osm_admin = st.sidebar.checkbox("Add municipality/county/voivodeship (OSM)", value=ENRICH_DEFAULT_OSM_ADMIN)
+
     st.sidebar.subheader("Rate limiting")
     pause_every = st.sidebar.number_input("Pause after X API calls", min_value=0, max_value=500, value=0, step=1,
                                           help="OSRM demo has its own limits; pausing is usually unnecessary.")
@@ -358,7 +469,7 @@ def sidebar():
         st.session_state["route_cache"] = {}
         st.sidebar.success("Route cache cleared")
 
-    return topn, pause_every, pause_secs, use_ref, ref_name, float(st.session_state.get("ref_lat", DEFAULT_REF['lat'])), float(st.session_state.get("ref_lon", DEFAULT_REF['lon']))
+    return topn, pause_every, pause_secs, use_ref, ref_name, float(st.session_state.get("ref_lat", DEFAULT_REF['lat'])), float(st.session_state.get("ref_lon", DEFAULT_REF['lon'])), enrich_nuts3, enrich_osm_admin
 
 
 def download_buttons_area():
@@ -456,9 +567,9 @@ def maybe_map(df: pd.DataFrame, airports: pd.DataFrame, seaports: pd.DataFrame):
 def main():
     st.set_page_config(page_title=APP_TITLE, layout="wide")
     st.title(APP_TITLE)
-    st.caption("Compute road distance/time from sites to nearest airport and container seaport (Top-N prefilter) and an optional reference location.")
+    st.caption("Compute road distance/time from sites to nearest airport and container seaport (Top-N prefilter), optional reference location, and admin enrichment.")
 
-    topn, pause_every, pause_secs, use_ref, ref_name, ref_lat, ref_lon = sidebar()
+    topn, pause_every, pause_secs, use_ref, ref_name, ref_lat, ref_lon, enrich_nuts3, enrich_osm_admin = sidebar()
 
     download_buttons_area()
 
@@ -491,6 +602,9 @@ def main():
                 pause_every=int(pause_every),
                 pause_secs=float(pause_secs),
                 progress_hook=progress_hook,
+                enrich_nuts3=enrich_nuts3,
+                enrich_osm_admin=enrich_osm_admin,
+            )
             )
             st.success(f"Completed. API calls: {api_calls}. Cached routes: {len(st.session_state.get('route_cache', {}))}.")
             if api_calls == 0:
@@ -508,6 +622,10 @@ def main():
                 "Site Name", "Latitude", "Longitude",
                 "Nearest Airport", "Distance to Airport (km)", "Time to Airport (min)",
                 "Nearest Seaport", "Distance to Seaport (km)", "Time to Seaport (min)",
+                "NUTS3 Code", "NUTS3 Name",
+                "Municipality", "Municipality Code",
+                "County", "County Code",
+                "Voivodeship", "Voivodeship Code",
             ]
             if use_ref:
                 cols += [f"Distance to {ref_name} (km)", f"Time to {ref_name} (min)"]
@@ -529,6 +647,11 @@ def main():
                             st.error("FATAL: " + step["fatal"])
 
             if st.checkbox("Show map preview (optional)"):
+                maybe_map(df_res, airports_df, seaports_df)
+
+            # Small hints
+            if enrich_nuts3 and not _HAS_SHAPELY:
+                st.warning("NUTS3 enrichment requested but Shapely is not installed. Add 'shapely>=2.0' to requirements.txt.")("Show map preview (optional)"):
                 maybe_map(df_res, airports_df, seaports_df)
 
         except Exception as e:
