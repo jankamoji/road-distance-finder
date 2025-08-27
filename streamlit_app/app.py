@@ -31,6 +31,10 @@ REQUIRED_SITES_COLS = ["Site Name", "Latitude", "Longitude"]
 REQUIRED_AIRPORTS_COLS = ["Airport Name", "Latitude", "Longitude"]
 REQUIRED_SEAPORTS_COLS = ["Seaport Name", "Latitude", "Longitude"]
 
+# Admin enrichment toggles (defaults)
+ENRICH_DEFAULT_NUTS3 = True
+ENRICH_DEFAULT_OSM_ADMIN = True
+
 # ---------------------- Utilities ----------------------
 
 def haversine_km(lat1, lon1, lat2, lon2):
