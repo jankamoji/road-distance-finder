@@ -31,10 +31,6 @@ REQUIRED_SITES_COLS = ["Site Name", "Latitude", "Longitude"]
 REQUIRED_AIRPORTS_COLS = ["Airport Name", "Latitude", "Longitude"]
 REQUIRED_SEAPORTS_COLS = ["Seaport Name", "Latitude", "Longitude"]
 
-# Admin enrichment toggles (defaults)
-ENRICH_DEFAULT_NUTS3 = True
-ENRICH_DEFAULT_OSM_ADMIN = True
-
 # ---------------------- Utilities ----------------------
 
 def haversine_km(lat1, lon1, lat2, lon2):
@@ -102,40 +98,64 @@ try:
 except Exception:
     _HAS_SHAPELY = False
 
-NUTS3_URL = "https://gisco-services.ec.europa.eu/distribution/v2/nuts/geojson/NUTS_RG_01M_2021_4326_LEVL_3.geojson"
+NUTS3_URL = "https://gisco-services.ec.europa.eu/distribution/v2/nuts/geojson/NUTS_RG_01M_2021_4326_LEVL_3.geojson"  # 2021 vintage, EPSG:4326
 
 @st.cache_data(show_spinner=False)
 def load_nuts3_index() -> Dict[str, Any]:
+    """Download NUTS3 GeoJSON and build an STRtree. Keep a fast id->props map.
+    Returns {ok, tree, geoms, id2props, count, msg}.
+    """
     if not _HAS_SHAPELY:
-        return {"ok": False, "msg": "Shapely not installed", "tree": None, "geoms": [], "props": []}
+        return {"ok": False, "msg": "Shapely not installed", "tree": None, "geoms": [], "id2props": {}, "count": 0}
     try:
-        r = requests.get(NUTS3_URL, timeout=40)
+        r = requests.get(NUTS3_URL, timeout=60)
         r.raise_for_status()
         gj = r.json()
-        geoms = []
-        props = []
+        geoms: List[Any] = []
+        id2props: Dict[int, Dict[str, Any]] = {}
+        count = 0
         for feat in gj.get("features", []):
+            pr = feat.get("properties", {})
             try:
                 geom = shape(feat.get("geometry"))
-                pr = feat.get("properties", {})
+                if geom.is_empty:
+                    continue
                 geoms.append(geom)
-                props.append({
+                id2props[id(geom)] = {
                     "NUTS_ID": pr.get("NUTS_ID"),
                     "NAME_LATN": pr.get("NAME_LATN"),
                     "CNTR_CODE": pr.get("CNTR_CODE"),
-                })
+                }
+                count += 1
             except Exception:
                 continue
+        if not geoms:
+            return {"ok": False, "msg": "No geometries parsed", "tree": None, "geoms": [], "id2props": {}, "count": 0}
         tree = STRtree(geoms)
-        return {"ok": True, "tree": tree, "geoms": geoms, "props": props}
+        return {"ok": True, "tree": tree, "geoms": geoms, "id2props": id2props, "count": count, "msg": ""}
     except Exception as e:
-        return {"ok": False, "msg": str(e), "tree": None, "geoms": [], "props": []}
+        return {"ok": False, "msg": str(e), "tree": None, "geoms": [], "id2props": {}, "count": 0}
 
 @st.cache_data(show_spinner=False)
 def nuts3_lookup(lat: float, lon: float) -> Dict[str, Any]:
     idx = load_nuts3_index()
     if not idx.get("ok"):
         return {}
+    pt = Point(float(lon), float(lat))
+    try:
+        candidates = idx["tree"].query(pt)
+        # Filter by precise topological relation; use covers to include boundary points
+        for geom in candidates:
+            try:
+                if geom.covers(pt):
+                    pr = idx["id2props"].get(id(geom))
+                    if pr:
+                        return pr
+            except Exception:
+                continue
+    except Exception:
+        return {}
+    return {}
     pt = Point(float(lon), float(lat))
     try:
         candidates = idx["tree"].query(pt)
@@ -288,48 +308,11 @@ def process_batch(
     enrich_nuts3: bool = ENRICH_DEFAULT_NUTS3,
     enrich_osm_admin: bool = ENRICH_DEFAULT_OSM_ADMIN,
 ) -> Tuple[pd.DataFrame, List[Dict[str, Any]], int]:
-    """Compute nearest airport, seaport, reference distance, and admin enrichment for each site."""
-
-    sites = sites.copy()
-    airports = airports.copy()
-    seaports = seaports.copy()
-
-    # Coerce numeric
-    for col in ["Latitude", "Longitude"]:
-        sites[col] = pd.to_numeric(sites[col], errors="coerce")
-        airports[col] = pd.to_numeric(airports[col], errors="coerce")
-        seaports[col] = pd.to_numeric(seaports[col], errors="coerce")
-
-    # Validate lat/lon
-    err = (
-        _validate_latlon(sites["Latitude"], sites["Longitude"])
-        or _validate_latlon(airports["Latitude"], airports["Longitude"])
-        or _validate_latlon(seaports["Latitude"], seaports["Longitude"])
-    )
-    if err:
-        raise ValueError(err)
-
-    a_lat = airports["Latitude"].to_numpy()
-    a_lon = airports["Longitude"].to_numpy()
-    p_lat = seaports["Latitude"].to_numpy()
-    p_lon = seaports["Longitude"].to_numpy()
-
-    route_cache = st.session_state.get("route_cache", {})
-
-    results: List[Dict[str, Any]] = []
-    logs: List[Dict[str, Any]] = []
-    api_calls = 0
-
-    total = len(sites)
-
-    for _, row in sites.iterrows():
         site_name = str(row["Site Name"]).strip()
-        slat = float(row["Latitude"])
-        slon = float(row["Longitude"])
+        slat = float(row["Latitude"]); slon = float(row["Longitude"]) 
         site_origin = (slat, slon)
 
         log_rec = {"site": site_name, "steps": []}
-
         out_rec: Dict[str, Any] = {
             "Site Name": site_name,
             "Latitude": round(slat, 6),
@@ -340,6 +323,7 @@ def process_batch(
             "Nearest Seaport": None,
             "Distance to Seaport (km)": None,
             "Time to Seaport (min)": None,
+            # Admin enrichment placeholders
             "NUTS3 Code": None,
             "NUTS3 Name": None,
             "Municipality": None,
@@ -349,30 +333,28 @@ def process_batch(
             "Voivodeship": None,
             "Voivodeship Code": None,
         }
-
         if include_ref:
             out_rec[f"Distance to {DEFAULT_REF['name']} (km)"] = None
             out_rec[f"Time to {DEFAULT_REF['name']} (min)"] = None
 
         try:
-            # --- Airports ---
+            # Airports: Haversine Top-N
             dists_a = haversine_km(slat, slon, a_lat, a_lon)
             idxs_a = np.argsort(dists_a)[: min(topn, len(airports))]
             cand_airports = airports.iloc[idxs_a].copy()
             log_rec["steps"].append({"msg": f"Top-{len(cand_airports)} airports: {cand_airports['Airport Name'].tolist()}"})
 
-            best_air, best_air_d, best_air_t = None, math.inf, math.inf
+            best_air = None; best_air_d = math.inf; best_air_t = math.inf
             for _, a in cand_airports.iterrows():
                 dest = (float(a["Latitude"]), float(a["Longitude"]))
                 try:
                     if api_calls and pause_every and api_calls % pause_every == 0:
-                        if progress_hook:
-                            progress_hook(f"Pausing {pause_secs}s to respect rate limits...")
+                        if progress_hook: progress_hook(f"Pausing {pause_secs}s to respect rate limits...")
                         time.sleep(pause_secs)
                     dist_km, dur_min = get_route(site_origin, dest, route_cache=route_cache)
                     api_calls += 1
                     if dist_km < best_air_d:
-                        best_air_d, best_air_t, best_air = dist_km, dur_min, a
+                        best_air_d = dist_km; best_air_t = dur_min; best_air = a
                 except Exception as e:
                     log_rec["steps"].append({"error": f"Airport '{a['Airport Name']}': {e}"})
 
@@ -383,24 +365,23 @@ def process_batch(
             else:
                 out_rec["Nearest Airport"] = "ERROR"
 
-            # --- Seaports ---
+            # Seaports: Haversine Top-N
             dists_p = haversine_km(slat, slon, p_lat, p_lon)
             idxs_p = np.argsort(dists_p)[: min(topn, len(seaports))]
             cand_ports = seaports.iloc[idxs_p].copy()
             log_rec["steps"].append({"msg": f"Top-{len(cand_ports)} seaports: {cand_ports['Seaport Name'].tolist()}"})
 
-            best_port, best_port_d, best_port_t = None, math.inf, math.inf
+            best_port = None; best_port_d = math.inf; best_port_t = math.inf
             for _, p in cand_ports.iterrows():
                 dest = (float(p["Latitude"]), float(p["Longitude"]))
                 try:
                     if api_calls and pause_every and api_calls % pause_every == 0:
-                        if progress_hook:
-                            progress_hook(f"Pausing {pause_secs}s to respect rate limits...")
+                        if progress_hook: progress_hook(f"Pausing {pause_secs}s to respect rate limits...")
                         time.sleep(pause_secs)
                     dist_km, dur_min = get_route(site_origin, dest, route_cache=route_cache)
                     api_calls += 1
                     if dist_km < best_port_d:
-                        best_port_d, best_port_t, best_port = dist_km, dur_min, p
+                        best_port_d = dist_km; best_port_t = dur_min; best_port = p
                 except Exception as e:
                     log_rec["steps"].append({"error": f"Seaport '{p['Seaport Name']}': {e}"})
 
@@ -411,12 +392,11 @@ def process_batch(
             else:
                 out_rec["Nearest Seaport"] = "ERROR"
 
-            # --- Reference ---
+            # Reference distance/time
             if include_ref:
                 try:
                     if api_calls and pause_every and api_calls % pause_every == 0:
-                        if progress_hook:
-                            progress_hook(f"Pausing {pause_secs}s to respect rate limits...")
+                        if progress_hook: progress_hook(f"Pausing {pause_secs}s to respect rate limits...")
                         time.sleep(pause_secs)
                     dist_km, dur_min = get_route(site_origin, (ref_lat, ref_lon), route_cache=route_cache)
                     api_calls += 1
@@ -425,7 +405,7 @@ def process_batch(
                 except Exception as e:
                     log_rec["steps"].append({"error": f"Reference: {e}"})
 
-            # --- Admin enrichment ---
+            # Admin enrichment
             if enrich_nuts3 and _HAS_SHAPELY:
                 try:
                     n = nuts3_lookup(slat, slon)
@@ -454,19 +434,28 @@ def process_batch(
 
         logs.append(log_rec)
         results.append(out_rec)
-        if progress_hook:
-            progress_hook(f"Processed {len(results)}/{total}")
+        if progress_hook: progress_hook(f"Processed {len(results)}/{total}")
 
-    # after loop
     st.session_state["route_cache"] = route_cache
     df_res = pd.DataFrame(results)
     return df_res, logs, api_calls
-
 
 # ---------------------- UI ----------------------
 
 def sidebar():
     st.sidebar.header("Settings")
+
+    # NUTS3 dataset status (help users debug missing enrichment)
+    with st.sidebar.expander("Datasets status", expanded=False):
+        if _HAS_SHAPELY:
+            idx = load_nuts3_index()
+            if idx.get("ok"):
+                st.markdown(f"**NUTS-3 polygons**: loaded ({idx.get('count', 0)} features)")
+            else:
+                st.markdown(f"**NUTS-3 polygons**: not loaded — {idx.get('msg', '')}")
+        else:
+            st.markdown("**NUTS-3 polygons**: Shapely not installed")
+        st.markdown("**OSM/Nominatim**: live reverse geocoding per site")
 
     # OpenStreetMap reference search (no API key required)
     ref_search = st.sidebar.text_input("Search reference by name (OpenStreetMap)", value="")
@@ -745,5 +734,5 @@ def main():
             st.exception(e)
 
 if __name__ == "__main__":
+ "__main__":
     main()
-
