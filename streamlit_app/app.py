@@ -1,4 +1,11 @@
-# app.py
+# app.py — Road Distance Finder (Streamlit)
+# Clean, deployable single-file app.
+# - OSRM routing (no API key)
+# - OSM search + reverse geocoding (no API key)
+# - Top-N prefilter via Haversine
+# - Optional reference destination
+# - NUTS-3 enrichment via EU GISCO (Shapely STRtree)
+# - Progress, caching, logs, CSV/XLSX export, optional map
 
 import io
 import time
@@ -14,7 +21,7 @@ import streamlit as st
 # Try to import UploadedFile for type hints; fall back for older Streamlit builds
 try:
     from streamlit.runtime.uploaded_file_manager import UploadedFile  # type: ignore
-except Exception:
+except Exception:  # type: ignore[misc]
     from typing import Any as UploadedFile  # type: ignore
 
 # Optional map dependencies (graceful degrade if unavailable)
@@ -31,6 +38,10 @@ REQUIRED_SITES_COLS = ["Site Name", "Latitude", "Longitude"]
 REQUIRED_AIRPORTS_COLS = ["Airport Name", "Latitude", "Longitude"]
 REQUIRED_SEAPORTS_COLS = ["Seaport Name", "Latitude", "Longitude"]
 
+# Admin enrichment toggles (defaults)
+ENRICH_DEFAULT_NUTS3 = True
+ENRICH_DEFAULT_OSM_ADMIN = True
+
 # ---------------------- Utilities ----------------------
 
 def haversine_km(lat1, lon1, lat2, lon2):
@@ -40,8 +51,8 @@ def haversine_km(lat1, lon1, lat2, lon2):
     phi2 = np.radians(lat2)
     dphi = np.radians(lat2 - lat1)
     dlambda = np.radians(lon2 - lon1)
-    a = np.sin(dphi/2.0)**2 + np.cos(phi1) * np.cos(phi2) * np.sin(dlambda/2.0)**2
-    c = 2 * np.arctan2(np.sqrt(a), np.sqrt(1-a))
+    a = np.sin(dphi / 2.0) ** 2 + np.cos(phi1) * np.cos(phi2) * np.sin(dlambda / 2.0) ** 2
+    c = 2 * np.arctan2(np.sqrt(a), np.sqrt(1 - a))
     return R * c
 
 @st.cache_data(show_spinner=False)
@@ -88,83 +99,78 @@ def template_files() -> Dict[str, bytes]:
 
     return out
 
-# ---------------------- NUTS 3 lookup (EU GISCO) ----------------------
+# ---------------------- NUTS-3 lookup (EU GISCO) ----------------------
 
 # Lightweight point-in-polygon using shapely STRtree; no geopandas dependency.
 try:
     from shapely.geometry import shape, Point  # type: ignore
-    from shapely.strtree import STRtree  # shapely >= 2.0
+    from shapely.strtree import STRtree  # type: ignore
     _HAS_SHAPELY = True
 except Exception:
     _HAS_SHAPELY = False
 
-NUTS3_URL = "https://gisco-services.ec.europa.eu/distribution/v2/nuts/geojson/NUTS_RG_01M_2021_4326_LEVL_3.geojson"  # 2021 vintage, EPSG:4326
+NUTS3_URL = (
+    "https://gisco-services.ec.europa.eu/distribution/v2/nuts/geojson/"
+    "NUTS_RG_01M_2021_4326_LEVL_3.geojson"
+)
 
-@st.cache_data(show_spinner=False)
+@st.cache_resource(show_spinner=False)
 def load_nuts3_index() -> Dict[str, Any]:
-    """Download NUTS3 GeoJSON and build an STRtree. Keep a fast id->props map.
-    Returns {ok, tree, geoms, id2props, count, msg}.
+    """Download NUTS3 GeoJSON and build an STRtree plus stable parallel lists.
+    Returns {ok, msg, tree, geoms, props, wkb2ix, count}.
     """
     if not _HAS_SHAPELY:
-        return {"ok": False, "msg": "Shapely not installed", "tree": None, "geoms": [], "id2props": {}, "count": 0}
+        return {"ok": False, "msg": "Shapely not installed", "tree": None, "geoms": [], "props": [], "wkb2ix": {}, "count": 0}
     try:
         r = requests.get(NUTS3_URL, timeout=60)
         r.raise_for_status()
         gj = r.json()
         geoms: List[Any] = []
-        id2props: Dict[int, Dict[str, Any]] = {}
-        count = 0
+        props: List[Dict[str, Any]] = []
+        wkb2ix: Dict[bytes, int] = {}
         for feat in gj.get("features", []):
-            pr = feat.get("properties", {})
             try:
-                geom = shape(feat.get("geometry"))
-                if geom.is_empty:
+                g = shape(feat["geometry"])
+                if g.is_empty:
                     continue
-                geoms.append(geom)
-                id2props[id(geom)] = {
+                ix = len(geoms)
+                geoms.append(g)
+                pr = feat.get("properties", {})
+                props.append({
                     "NUTS_ID": pr.get("NUTS_ID"),
                     "NAME_LATN": pr.get("NAME_LATN"),
                     "CNTR_CODE": pr.get("CNTR_CODE"),
-                }
-                count += 1
+                })
+                try:
+                    wkb2ix[g.wkb] = ix
+                except Exception:
+                    pass
             except Exception:
                 continue
         if not geoms:
-            return {"ok": False, "msg": "No geometries parsed", "tree": None, "geoms": [], "id2props": {}, "count": 0}
+            return {"ok": False, "msg": "No geometries parsed", "tree": None, "geoms": [], "props": [], "wkb2ix": {}, "count": 0}
         tree = STRtree(geoms)
-        return {"ok": True, "tree": tree, "geoms": geoms, "id2props": id2props, "count": count, "msg": ""}
+        return {"ok": True, "msg": "", "tree": tree, "geoms": geoms, "props": props, "wkb2ix": wkb2ix, "count": len(geoms)}
     except Exception as e:
-        return {"ok": False, "msg": str(e), "tree": None, "geoms": [], "id2props": {}, "count": 0}
+        return {"ok": False, "msg": str(e), "tree": None, "geoms": [], "props": [], "wkb2ix": {}, "count": 0}
 
-@st.cache_data(show_spinner=False)
+# Plain function (fast) using cached index above
+
 def nuts3_lookup(lat: float, lon: float) -> Dict[str, Any]:
     idx = load_nuts3_index()
     if not idx.get("ok"):
         return {}
-    pt = Point(float(lon), float(lat))
+    pt = Point(float(lon), float(lat))  # shapely expects (x=lon, y=lat)
     try:
-        candidates = idx["tree"].query(pt)
-        # Filter by precise topological relation; use covers to include boundary points
-        for geom in candidates:
+        cands = idx["tree"].query(pt)
+        for g in cands:
             try:
-                if geom.covers(pt):
-                    pr = idx["id2props"].get(id(geom))
-                    if pr:
-                        return pr
-            except Exception:
-                continue
-    except Exception:
-        return {}
-    return {}
-    pt = Point(float(lon), float(lat))
-    try:
-        candidates = idx["tree"].query(pt)
-        # filter by actual contains/intersects
-        for geom in candidates:
-            try:
-                if geom.contains(pt) or geom.intersects(pt):
-                    i = idx["geoms"].index(geom)
-                    return idx["props"][i]
+                if g.covers(pt):  # includes boundary
+                    ix = idx["wkb2ix"].get(g.wkb)
+                    if ix is None:
+                        # Fallback: search by equality in the original list
+                        ix = idx["geoms"].index(g)
+                    return idx["props"][ix]
             except Exception:
                 continue
     except Exception:
@@ -191,11 +197,15 @@ def osm_reverse(lat: float, lon: float) -> Dict[str, Any]:
         data = r.json()
         addr = data.get("address", {})
         ex = data.get("extratags", {})
-        # Best-effort extraction across Europe; for PL this maps to gmina/powiat/województwo
-        municipality = addr.get("municipality") or addr.get("city") or addr.get("town") or addr.get("village") or addr.get("suburb")
+        municipality = (
+            addr.get("municipality")
+            or addr.get("city")
+            or addr.get("town")
+            or addr.get("village")
+            or addr.get("suburb")
+        )
         county = addr.get("county") or addr.get("state_district")
         voivodeship = addr.get("state")
-        # Codes (if present). Nominatim sometimes exposes ISO3166-2 codes per level and OSM tags.
         muni_code = ex.get("ref:teryt:simc") or ex.get("ref:teryt") or ""
         county_code = ex.get("ref:teryt:powiat") or ""
         voiv_code = ex.get("ref:teryt:wojewodztwo") or addr.get("ISO3166-2-lvl4") or ""
@@ -208,9 +218,16 @@ def osm_reverse(lat: float, lon: float) -> Dict[str, Any]:
             "voivodeship_code": voiv_code,
         }
     except Exception:
-        return {"municipality": "", "municipality_code": "", "county": "", "county_code": "", "voivodeship": "", "voivodeship_code": ""}
+        return {
+            "municipality": "",
+            "municipality_code": "",
+            "county": "",
+            "county_code": "",
+            "voivodeship": "",
+            "voivodeship_code": "",
+        }
 
-# ---------------------- Routing (OSRM public demo) ----------------------  
+# ---------------------- Routing (OSRM public demo) ----------------------
 
 OSRM_URL = (
     "https://router.project-osrm.org/route/v1/driving/"
@@ -247,13 +264,12 @@ def get_route(origin: Tuple[float, float], dest: Tuple[float, float], route_cach
     route_cache[key] = {"distance_km": dist_km, "duration_min": dur_min}
     return dist_km, dur_min
 
-# ---------------------- OpenStreetMap (Nominatim) search ----------------------  
+# ---------------------- OSM (Nominatim) forward search ----------------------
 
 NOMINATIM_SEARCH = "https://nominatim.openstreetmap.org/search"
 
 @st.cache_data(show_spinner=False)
 def osm_search(query: str, limit: int = 5) -> List[Dict[str, Any]]:
-    """Free, keyless place search via Nominatim. Returns list of dicts with display_name, lat, lon."""
     if not query:
         return []
     params = {"q": query, "format": "json", "addressdetails": 1, "limit": limit}
@@ -308,8 +324,43 @@ def process_batch(
     enrich_nuts3: bool = ENRICH_DEFAULT_NUTS3,
     enrich_osm_admin: bool = ENRICH_DEFAULT_OSM_ADMIN,
 ) -> Tuple[pd.DataFrame, List[Dict[str, Any]], int]:
+    """Compute nearest airport, seaport, optional reference, and admin enrichment for each site."""
+
+    sites = sites.copy()
+    airports = airports.copy()
+    seaports = seaports.copy()
+
+    # Coerce numeric
+    for col in ["Latitude", "Longitude"]:
+        sites[col] = pd.to_numeric(sites[col], errors="coerce")
+        airports[col] = pd.to_numeric(airports[col], errors="coerce")
+        seaports[col] = pd.to_numeric(seaports[col], errors="coerce")
+
+    # Validate lat/lon
+    err = (
+        _validate_latlon(sites["Latitude"], sites["Longitude"]) or
+        _validate_latlon(airports["Latitude"], airports["Longitude"]) or
+        _validate_latlon(seaports["Latitude"], seaports["Longitude"]) 
+    )
+    if err:
+        raise ValueError(err)
+
+    a_lat = airports["Latitude"].to_numpy()
+    a_lon = airports["Longitude"].to_numpy()
+    p_lat = seaports["Latitude"].to_numpy()
+    p_lon = seaports["Longitude"].to_numpy()
+
+    route_cache = st.session_state.get("route_cache", {})
+
+    results: List[Dict[str, Any]] = []
+    logs: List[Dict[str, Any]] = []
+    api_calls = 0
+    total = len(sites)
+
+    for _, row in sites.iterrows():
         site_name = str(row["Site Name"]).strip()
-        slat = float(row["Latitude"]); slon = float(row["Longitude"]) 
+        slat = float(row["Latitude"])
+        slon = float(row["Longitude"])
         site_origin = (slat, slon)
 
         log_rec = {"site": site_name, "steps": []}
@@ -323,7 +374,6 @@ def process_batch(
             "Nearest Seaport": None,
             "Distance to Seaport (km)": None,
             "Time to Seaport (min)": None,
-            # Admin enrichment placeholders
             "NUTS3 Code": None,
             "NUTS3 Name": None,
             "Municipality": None,
@@ -338,65 +388,62 @@ def process_batch(
             out_rec[f"Time to {DEFAULT_REF['name']} (min)"] = None
 
         try:
-            # Airports: Haversine Top-N
+            # Airports
             dists_a = haversine_km(slat, slon, a_lat, a_lon)
             idxs_a = np.argsort(dists_a)[: min(topn, len(airports))]
             cand_airports = airports.iloc[idxs_a].copy()
             log_rec["steps"].append({"msg": f"Top-{len(cand_airports)} airports: {cand_airports['Airport Name'].tolist()}"})
 
-            best_air = None; best_air_d = math.inf; best_air_t = math.inf
+            best_air, best_air_d, best_air_t = None, math.inf, math.inf
             for _, a in cand_airports.iterrows():
                 dest = (float(a["Latitude"]), float(a["Longitude"]))
                 try:
                     if api_calls and pause_every and api_calls % pause_every == 0:
-                        if progress_hook: progress_hook(f"Pausing {pause_secs}s to respect rate limits...")
+                        if progress_hook:
+                            progress_hook(f"Pausing {pause_secs}s to respect rate limits...")
                         time.sleep(pause_secs)
                     dist_km, dur_min = get_route(site_origin, dest, route_cache=route_cache)
                     api_calls += 1
                     if dist_km < best_air_d:
-                        best_air_d = dist_km; best_air_t = dur_min; best_air = a
+                        best_air, best_air_d, best_air_t = a, dist_km, dur_min
                 except Exception as e:
                     log_rec["steps"].append({"error": f"Airport '{a['Airport Name']}': {e}"})
-
             if best_air is not None:
                 out_rec["Nearest Airport"] = str(best_air.get("Airport Name"))
                 out_rec["Distance to Airport (km)"] = round(best_air_d, 1)
                 out_rec["Time to Airport (min)"] = round(best_air_t, 1)
-            else:
-                out_rec["Nearest Airport"] = "ERROR"
 
-            # Seaports: Haversine Top-N
+            # Seaports
             dists_p = haversine_km(slat, slon, p_lat, p_lon)
             idxs_p = np.argsort(dists_p)[: min(topn, len(seaports))]
             cand_ports = seaports.iloc[idxs_p].copy()
             log_rec["steps"].append({"msg": f"Top-{len(cand_ports)} seaports: {cand_ports['Seaport Name'].tolist()}"})
 
-            best_port = None; best_port_d = math.inf; best_port_t = math.inf
+            best_port, best_port_d, best_port_t = None, math.inf, math.inf
             for _, p in cand_ports.iterrows():
                 dest = (float(p["Latitude"]), float(p["Longitude"]))
                 try:
                     if api_calls and pause_every and api_calls % pause_every == 0:
-                        if progress_hook: progress_hook(f"Pausing {pause_secs}s to respect rate limits...")
+                        if progress_hook:
+                            progress_hook(f"Pausing {pause_secs}s to respect rate limits...")
                         time.sleep(pause_secs)
                     dist_km, dur_min = get_route(site_origin, dest, route_cache=route_cache)
                     api_calls += 1
                     if dist_km < best_port_d:
-                        best_port_d = dist_km; best_port_t = dur_min; best_port = p
+                        best_port, best_port_d, best_port_t = p, dist_km, dur_min
                 except Exception as e:
                     log_rec["steps"].append({"error": f"Seaport '{p['Seaport Name']}': {e}"})
-
             if best_port is not None:
                 out_rec["Nearest Seaport"] = str(best_port.get("Seaport Name"))
                 out_rec["Distance to Seaport (km)"] = round(best_port_d, 1)
                 out_rec["Time to Seaport (min)"] = round(best_port_t, 1)
-            else:
-                out_rec["Nearest Seaport"] = "ERROR"
 
-            # Reference distance/time
+            # Reference
             if include_ref:
                 try:
                     if api_calls and pause_every and api_calls % pause_every == 0:
-                        if progress_hook: progress_hook(f"Pausing {pause_secs}s to respect rate limits...")
+                        if progress_hook:
+                            progress_hook(f"Pausing {pause_secs}s to respect rate limits...")
                         time.sleep(pause_secs)
                     dist_km, dur_min = get_route(site_origin, (ref_lat, ref_lon), route_cache=route_cache)
                     api_calls += 1
@@ -405,18 +452,15 @@ def process_batch(
                 except Exception as e:
                     log_rec["steps"].append({"error": f"Reference: {e}"})
 
-            # Admin enrichment
+            # Enrichment
             if enrich_nuts3 and _HAS_SHAPELY:
                 try:
-                    n = nuts3_lookup(slat, slon)
+                    n = nuts3_lookup(lat=slat, lon=slon)
                     if n:
                         out_rec["NUTS3 Code"] = n.get("NUTS_ID")
                         out_rec["NUTS3 Name"] = n.get("NAME_LATN")
                 except Exception as e:
                     log_rec["steps"].append({"error": f"NUTS3 lookup: {e}"})
-            elif enrich_nuts3 and not _HAS_SHAPELY:
-                log_rec["steps"].append({"error": "NUTS3 lookup skipped: shapely not installed"})
-
             if enrich_osm_admin:
                 try:
                     adm = osm_reverse(slat, slon)
@@ -428,14 +472,15 @@ def process_batch(
                     out_rec["Voivodeship Code"] = adm.get("voivodeship_code") or None
                 except Exception as e:
                     log_rec["steps"].append({"error": f"OSM admin reverse: {e}"})
-
         except Exception as e:
             log_rec["steps"].append({"fatal": str(e)})
 
         logs.append(log_rec)
         results.append(out_rec)
-        if progress_hook: progress_hook(f"Processed {len(results)}/{total}")
+        if progress_hook:
+            progress_hook(f"Processed {len(results)}/{total}")
 
+    # After loop
     st.session_state["route_cache"] = route_cache
     df_res = pd.DataFrame(results)
     return df_res, logs, api_calls
@@ -445,7 +490,7 @@ def process_batch(
 def sidebar():
     st.sidebar.header("Settings")
 
-    # NUTS3 dataset status (help users debug missing enrichment)
+    # Datasets status
     with st.sidebar.expander("Datasets status", expanded=False):
         if _HAS_SHAPELY:
             idx = load_nuts3_index()
@@ -456,6 +501,17 @@ def sidebar():
         else:
             st.markdown("**NUTS-3 polygons**: Shapely not installed")
         st.markdown("**OSM/Nominatim**: live reverse geocoding per site")
+
+    # NUTS-3 tester
+    with st.sidebar.expander("NUTS-3 tester", expanded=False):
+        t_lat = st.number_input("Lat", value=DEFAULT_REF["lat"], format="%.6f", key="nuts_t_lat")
+        t_lon = st.number_input("Lon", value=DEFAULT_REF["lon"], format="%.6f", key="nuts_t_lon")
+        if st.button("Test NUTS lookup"):
+            res = nuts3_lookup(lat=float(t_lat), lon=float(t_lon)) if _HAS_SHAPELY else {}
+            if res:
+                st.success(f"{res.get('NUTS_ID')} — {res.get('NAME_LATN')}")
+            else:
+                st.warning("No NUTS-3 match (check Shapely install and dataset status)")
 
     # OpenStreetMap reference search (no API key required)
     ref_search = st.sidebar.text_input("Search reference by name (OpenStreetMap)", value="")
@@ -734,5 +790,4 @@ def main():
             st.exception(e)
 
 if __name__ == "__main__":
- "__main__":
     main()
