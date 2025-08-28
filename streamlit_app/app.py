@@ -157,25 +157,51 @@ def load_nuts3_index() -> Dict[str, Any]:
 # Plain function (fast) using cached index above
 
 def nuts3_lookup(lat: float, lon: float) -> Dict[str, Any]:
+    """Return NUTS-3 props for a WGS84 lat/lon.
+    Robust version: try STRtree first; if no hit, do a linear scan fallback.
+    """
     idx = load_nuts3_index()
     if not idx.get("ok"):
         return {}
     pt = Point(float(lon), float(lat))  # shapely expects (x=lon, y=lat)
+
+    # First try: STRtree candidates
     try:
         cands = idx["tree"].query(pt)
-        for g in cands:
-            try:
-                if g.covers(pt):  # includes boundary
-                    ix = idx["wkb2ix"].get(g.wkb)
-                    if ix is None:
-                        # Fallback: search by equality in the original list
+    except Exception:
+        cands = []
+
+    # Check candidates from the tree
+    for g in cands:
+        try:
+            if g.covers(pt) or g.contains(pt) or g.intersects(pt):
+                ix = idx["wkb2ix"].get(g.wkb)
+                if ix is None:
+                    # Fallback: equality search within original list (works if WKB map fails)
+                    try:
                         ix = idx["geoms"].index(g)
+                    except Exception:
+                        ix = None
+                if ix is not None:
                     return idx["props"][ix]
+        except Exception:
+            continue
+
+    # Bruteforce fallback (handles edge cases on some hosts)
+    try:
+        geoms = idx["geoms"]
+        props = idx["props"]
+        for ix, g in enumerate(geoms):
+            try:
+                if g.covers(pt) or g.contains(pt) or g.intersects(pt):
+                    return props[ix]
             except Exception:
                 continue
     except Exception:
-        return {}
+        pass
+
     return {}
+
 
 # ---------------------- OSM Reverse Geocoding (admin levels) ----------------------
 
