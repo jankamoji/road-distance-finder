@@ -1,11 +1,7 @@
 # app.py — Road Distance Finder (Streamlit)
-# Clean, deployable single-file app.
-# - OSRM routing (no API key)
-# - OSM search + reverse geocoding (no API key)
-# - Top-N prefilter via Haversine
-# - Optional reference destination
-# - NUTS-3 enrichment via EU GISCO (Shapely STRtree)
-# - Progress, caching, logs, CSV/XLSX export, optional map
+# Final, deployable version: distances via OSRM, OSM search/reverse, Top-N prefilter,
+# NUTS-3 enrichment (GISCO) and **official Polish admin polygons auto-loaded** (LAU/ADM1/ADM2).
+# Also supports optional user uploads to override the official layers.
 
 import io
 import time
@@ -18,13 +14,12 @@ import pandas as pd
 import requests
 import streamlit as st
 
-# Try to import UploadedFile for type hints; fall back for older Streamlit builds
+# ---------------------- Optional imports ----------------------
 try:
     from streamlit.runtime.uploaded_file_manager import UploadedFile  # type: ignore
-except Exception:  # type: ignore[misc]
+except Exception:
     from typing import Any as UploadedFile  # type: ignore
 
-# Optional map dependencies (graceful degrade if unavailable)
 try:
     from streamlit_folium import st_folium  # type: ignore
     import folium  # type: ignore
@@ -32,13 +27,22 @@ try:
 except Exception:
     _HAS_MAP = False
 
+# Shapely for geometry / NUTS & admin polygons
+try:
+    from shapely.geometry import shape, Point  # type: ignore
+    from shapely.strtree import STRtree  # type: ignore
+    _HAS_SHAPELY = True
+except Exception:
+    _HAS_SHAPELY = False
+
+# ---------------------- App constants ----------------------
 APP_TITLE = "Road Distance Finder"
 DEFAULT_REF = {"name": "Bedburg, Germany", "lat": 51.0126, "lon": 6.5741}
 REQUIRED_SITES_COLS = ["Site Name", "Latitude", "Longitude"]
 REQUIRED_AIRPORTS_COLS = ["Airport Name", "Latitude", "Longitude"]
 REQUIRED_SEAPORTS_COLS = ["Seaport Name", "Latitude", "Longitude"]
 
-# Admin enrichment toggles (defaults)
+# Enrichment toggles
 ENRICH_DEFAULT_NUTS3 = True
 ENRICH_DEFAULT_OSM_ADMIN = True
 
@@ -57,7 +61,6 @@ def haversine_km(lat1, lon1, lat2, lon2):
 
 @st.cache_data(show_spinner=False)
 def template_files() -> Dict[str, bytes]:
-    """Generate the three Excel templates in-memory with example rows."""
     out: Dict[str, bytes] = {}
 
     # Sites.xlsx
@@ -99,15 +102,7 @@ def template_files() -> Dict[str, bytes]:
 
     return out
 
-# ---------------------- NUTS-3 lookup (EU GISCO) ----------------------
-
-# Lightweight point-in-polygon using shapely STRtree; no geopandas dependency.
-try:
-    from shapely.geometry import shape, Point  # type: ignore
-    from shapely.strtree import STRtree  # type: ignore
-    _HAS_SHAPELY = True
-except Exception:
-    _HAS_SHAPELY = False
+# ---------------------- NUTS-3 (EU GISCO) ----------------------
 
 NUTS3_URL = (
     "https://gisco-services.ec.europa.eu/distribution/v2/nuts/geojson/"
@@ -116,9 +111,6 @@ NUTS3_URL = (
 
 @st.cache_resource(show_spinner=False)
 def load_nuts3_index() -> Dict[str, Any]:
-    """Download NUTS3 GeoJSON and build an STRtree plus stable parallel lists.
-    Returns {ok, msg, tree, geoms, props, wkb2ix, count}.
-    """
     if not _HAS_SHAPELY:
         return {"ok": False, "msg": "Shapely not installed", "tree": None, "geoms": [], "props": [], "wkb2ix": {}, "count": 0}
     try:
@@ -154,30 +146,22 @@ def load_nuts3_index() -> Dict[str, Any]:
     except Exception as e:
         return {"ok": False, "msg": str(e), "tree": None, "geoms": [], "props": [], "wkb2ix": {}, "count": 0}
 
-# Plain function (fast) using cached index above
 
 def nuts3_lookup(lat: float, lon: float) -> Dict[str, Any]:
-    """Return NUTS-3 props for a WGS84 lat/lon.
-    Robust version: try STRtree first; if no hit, do a linear scan fallback.
-    """
+    """Robust point-in-polygon lookup for NUTS-3."""
     idx = load_nuts3_index()
     if not idx.get("ok"):
         return {}
-    pt = Point(float(lon), float(lat))  # shapely expects (x=lon, y=lat)
-
-    # First try: STRtree candidates
+    pt = Point(float(lon), float(lat))
     try:
         cands = idx["tree"].query(pt)
     except Exception:
         cands = []
-
-    # Check candidates from the tree
     for g in cands:
         try:
             if g.covers(pt) or g.contains(pt) or g.intersects(pt):
                 ix = idx["wkb2ix"].get(g.wkb)
                 if ix is None:
-                    # Fallback: equality search within original list (works if WKB map fails)
                     try:
                         ix = idx["geoms"].index(g)
                     except Exception:
@@ -186,36 +170,24 @@ def nuts3_lookup(lat: float, lon: float) -> Dict[str, Any]:
                     return idx["props"][ix]
         except Exception:
             continue
-
-    # Bruteforce fallback (handles edge cases on some hosts)
     try:
-        geoms = idx["geoms"]
-        props = idx["props"]
-        for ix, g in enumerate(geoms):
+        for ix, g in enumerate(idx["geoms"]):
             try:
                 if g.covers(pt) or g.contains(pt) or g.intersects(pt):
-                    return props[ix]
+                    return idx["props"][ix]
             except Exception:
                 continue
     except Exception:
         pass
-
     return {}
 
-
-# ---------------------- OSM Reverse Geocoding (admin levels) ----------------------
+# ---------------------- OSM Reverse Geocoding ----------------------
 
 NOMINATIM_REVERSE = "https://nominatim.openstreetmap.org/reverse"
 
 @st.cache_data(show_spinner=False)
 def osm_reverse(lat: float, lon: float) -> Dict[str, Any]:
-    params = {
-        "format": "jsonv2",
-        "lat": float(lat),
-        "lon": float(lon),
-        "addressdetails": 1,
-        "extratags": 1,
-    }
+    params = {"format": "jsonv2", "lat": float(lat), "lon": float(lon), "addressdetails": 1, "extratags": 1}
     headers = {"User-Agent": "RoadDistanceFinder/1.0 (contact: example@example.com)"}
     try:
         r = requests.get(NOMINATIM_REVERSE, params=params, headers=headers, timeout=12)
@@ -223,13 +195,7 @@ def osm_reverse(lat: float, lon: float) -> Dict[str, Any]:
         data = r.json()
         addr = data.get("address", {})
         ex = data.get("extratags", {})
-        municipality = (
-            addr.get("municipality")
-            or addr.get("city")
-            or addr.get("town")
-            or addr.get("village")
-            or addr.get("suburb")
-        )
+        municipality = addr.get("municipality") or addr.get("city") or addr.get("town") or addr.get("village") or addr.get("suburb")
         county = addr.get("county") or addr.get("state_district")
         voivodeship = addr.get("state")
         muni_code = ex.get("ref:teryt:simc") or ex.get("ref:teryt") or ""
@@ -244,16 +210,9 @@ def osm_reverse(lat: float, lon: float) -> Dict[str, Any]:
             "voivodeship_code": voiv_code,
         }
     except Exception:
-        return {
-            "municipality": "",
-            "municipality_code": "",
-            "county": "",
-            "county_code": "",
-            "voivodeship": "",
-            "voivodeship_code": "",
-        }
+        return {"municipality": "", "municipality_code": "", "county": "", "county_code": "", "voivodeship": "", "voivodeship_code": ""}
 
-# ---------------------- Routing (OSRM public demo) ----------------------
+# ---------------------- Routing (OSRM) ----------------------
 
 OSRM_URL = (
     "https://router.project-osrm.org/route/v1/driving/"
@@ -261,7 +220,6 @@ OSRM_URL = (
 )
 
 def route_via_osrm(origin: Tuple[float, float], dest: Tuple[float, float], timeout_s: int = 20) -> Tuple[float, float]:
-    """Call OSRM public demo for driving route; return (km, minutes)."""
     url = OSRM_URL.format(lon1=origin[1], lat1=origin[0], lon2=dest[1], lat2=dest[0])
     r = requests.get(url, timeout=timeout_s)
     if r.status_code != 200:
@@ -279,7 +237,6 @@ def _route_key(origin: Tuple[float, float], dest: Tuple[float, float]) -> str:
     return f"OSRM:{origin[0]:.6f},{origin[1]:.6f}->{dest[0]:.6f},{dest[1]:.6f}"
 
 def get_route(origin: Tuple[float, float], dest: Tuple[float, float], route_cache: Dict[str, Dict[str, float]] | None = None) -> Tuple[float, float]:
-    """Memoized routing wrapper for OSRM."""
     if route_cache is None:
         route_cache = {}
     key = _route_key(origin, dest)
@@ -290,7 +247,7 @@ def get_route(origin: Tuple[float, float], dest: Tuple[float, float], route_cach
     route_cache[key] = {"distance_km": dist_km, "duration_min": dur_min}
     return dist_km, dur_min
 
-# ---------------------- OSM (Nominatim) forward search ----------------------
+# ---------------------- OSM forward search ----------------------
 
 NOMINATIM_SEARCH = "https://nominatim.openstreetmap.org/search"
 
@@ -307,16 +264,113 @@ def osm_search(query: str, limit: int = 5) -> List[Dict[str, Any]]:
         out: List[Dict[str, Any]] = []
         for res in results:
             try:
-                out.append({
-                    "display_name": str(res.get("display_name", "")),
-                    "lat": float(res.get("lat")),
-                    "lon": float(res.get("lon")),
-                })
+                out.append({"display_name": str(res.get("display_name", "")), "lat": float(res.get("lat")), "lon": float(res.get("lon"))})
             except Exception:
                 continue
         return out
     except Exception:
         return []
+
+# ---------------------- Official Polish admin polygons (auto + optional upload) ----------------------
+# We auto-fetch official WFS GeoJSON from Polish Geoportal PRG for: gminy, powiaty, województwa.
+
+@st.cache_resource(show_spinner=False)
+def load_official_admin_indices() -> Dict[str, Any]:
+    if not _HAS_SHAPELY:
+        return {}
+    urls = {
+        "gmina": "https://mapy.geoportal.gov.pl/wss/service/PZGIK/PRG/WFS/AdministrativeBoundaries?SERVICE=WFS&VERSION=2.0.0&REQUEST=GetFeature&TYPENAMES=prg:gminy&OUTPUTFORMAT=application/json",
+        "powiat": "https://mapy.geoportal.gov.pl/wss/service/PZGIK/PRG/WFS/AdministrativeBoundaries?SERVICE=WFS&VERSION=2.0.0&REQUEST=GetFeature&TYPENAMES=prg:powiaty&OUTPUTFORMAT=application/json",
+        "woj": "https://mapy.geoportal.gov.pl/wss/service/PZGIK/PRG/WFS/AdministrativeBoundaries?SERVICE=WFS&VERSION=2.0.0&REQUEST=GetFeature&TYPENAMES=prg:wojewodztwa&OUTPUTFORMAT=application/json",
+    }
+    out: Dict[str, Any] = {}
+    for level, url in urls.items():
+        try:
+            r = requests.get(url, timeout=60)
+            r.raise_for_status()
+            gj = r.json()
+            idx = build_admin_index_from_geojson(
+                gj,
+                code_field="JPT_KOD_JE",
+                name_field="JPT_NAZWA_",
+                alt_code_fields=["TERYT", "TERC"],
+                alt_name_fields=["NAZWA"],
+            )
+            if idx:
+                out[level] = idx
+        except Exception:
+            continue
+    return out
+
+class AdminIndex:
+    def __init__(self, geoms: List[Any], props: List[Dict[str, Any]]):
+        self.geoms = geoms
+        self.props = props
+        self.tree = STRtree(geoms) if (geoms and _HAS_SHAPELY) else None
+
+    def lookup(self, lat: float, lon: float) -> Dict[str, Any]:
+        if not self.tree:
+            return {}
+        pt = Point(float(lon), float(lat))
+        try:
+            cands = self.tree.query(pt)
+        except Exception:
+            cands = []
+        for g in cands:
+            try:
+                if g.covers(pt) or g.contains(pt) or g.intersects(pt):
+                    try:
+                        ix = self.geoms.index(g)
+                    except Exception:
+                        ix = None
+                    if ix is not None:
+                        return self.props[ix]
+            except Exception:
+                continue
+        for ix, g in enumerate(self.geoms):
+            try:
+                if g.covers(pt) or g.contains(pt) or g.intersects(pt):
+                    return self.props[ix]
+            except Exception:
+                continue
+        return {}
+
+
+def build_admin_index_from_geojson(gj: Dict[str, Any], code_field: str, name_field: str, alt_code_fields=None, alt_name_fields=None) -> AdminIndex | None:
+    if not _HAS_SHAPELY:
+        return None
+    try:
+        geoms: List[Any] = []
+        props: List[Dict[str, Any]] = []
+        for feat in gj.get("features", []):
+            pr = feat.get("properties", {})
+            try:
+                g = shape(feat.get("geometry"))
+                if g.is_empty:
+                    continue
+                code_val = pr.get(code_field)
+                name_val = pr.get(name_field)
+                if (not code_val) and alt_code_fields:
+                    for cf in alt_code_fields:
+                        if pr.get(cf):
+                            code_val = pr.get(cf); break
+                if (not name_val) and alt_name_fields:
+                    for nf in alt_name_fields:
+                        if pr.get(nf):
+                            name_val = pr.get(nf); break
+                geoms.append(g)
+                props.append({"code": str(code_val or ""), "name": str(name_val or "")})
+            except Exception:
+                continue
+        if not geoms:
+            return None
+        return AdminIndex(geoms, props)
+    except Exception:
+        return None
+
+# Put auto indices into session once
+if "official_admin" not in st.session_state:
+    st.session_state["official_admin"] = load_official_admin_indices()
 
 # ---------------------- Validation ----------------------
 
@@ -350,11 +404,8 @@ def process_batch(
     enrich_nuts3: bool = ENRICH_DEFAULT_NUTS3,
     enrich_osm_admin: bool = ENRICH_DEFAULT_OSM_ADMIN,
 ) -> Tuple[pd.DataFrame, List[Dict[str, Any]], int]:
-    """Compute nearest airport, seaport, optional reference, and admin enrichment for each site."""
 
-    sites = sites.copy()
-    airports = airports.copy()
-    seaports = seaports.copy()
+    sites = sites.copy(); airports = airports.copy(); seaports = seaports.copy()
 
     # Coerce numeric
     for col in ["Latitude", "Longitude"]:
@@ -362,7 +413,6 @@ def process_batch(
         airports[col] = pd.to_numeric(airports[col], errors="coerce")
         seaports[col] = pd.to_numeric(seaports[col], errors="coerce")
 
-    # Validate lat/lon
     err = (
         _validate_latlon(sites["Latitude"], sites["Longitude"]) or
         _validate_latlon(airports["Latitude"], airports["Longitude"]) or
@@ -371,10 +421,8 @@ def process_batch(
     if err:
         raise ValueError(err)
 
-    a_lat = airports["Latitude"].to_numpy()
-    a_lon = airports["Longitude"].to_numpy()
-    p_lat = seaports["Latitude"].to_numpy()
-    p_lon = seaports["Longitude"].to_numpy()
+    a_lat = airports["Latitude"].to_numpy(); a_lon = airports["Longitude"].to_numpy()
+    p_lat = seaports["Latitude"].to_numpy(); p_lon = seaports["Longitude"].to_numpy()
 
     route_cache = st.session_state.get("route_cache", {})
 
@@ -385,8 +433,7 @@ def process_batch(
 
     for _, row in sites.iterrows():
         site_name = str(row["Site Name"]).strip()
-        slat = float(row["Latitude"])
-        slon = float(row["Longitude"])
+        slat = float(row["Latitude"]); slon = float(row["Longitude"])
         site_origin = (slat, slon)
 
         log_rec = {"site": site_name, "steps": []}
@@ -487,17 +534,66 @@ def process_batch(
                         out_rec["NUTS3 Name"] = n.get("NAME_LATN")
                 except Exception as e:
                     log_rec["steps"].append({"error": f"NUTS3 lookup: {e}"})
-            if enrich_osm_admin:
+
+            # Prefer official polygons (auto first, then user override), then OSM fallback
+            have_official = False
+            try:
+                auto = st.session_state.get("official_admin", {})
+                idx_woj_a = auto.get("woj"); idx_pow_a = auto.get("powiat"); idx_gmi_a = auto.get("gmina")
+                if idx_woj_a:
+                    w = idx_woj_a.lookup(slat, slon)
+                    if w:
+                        out_rec["Voivodeship"] = w.get("name") or out_rec.get("Voivodeship")
+                        out_rec["Voivodeship Code"] = w.get("code") or out_rec.get("Voivodeship Code")
+                        have_official = True
+                if idx_pow_a:
+                    p = idx_pow_a.lookup(slat, slon)
+                    if p:
+                        out_rec["County"] = p.get("name") or out_rec.get("County")
+                        out_rec["County Code"] = p.get("code") or out_rec.get("County Code")
+                        have_official = True
+                if idx_gmi_a:
+                    g = idx_gmi_a.lookup(slat, slon)
+                    if g:
+                        out_rec["Municipality"] = g.get("name") or out_rec.get("Municipality")
+                        out_rec["Municipality Code"] = g.get("code") or out_rec.get("Municipality Code")
+                        have_official = True
+
+                # User uploaded overrides (if you later add upload UI storing idx_* in session)
+                idx_woj_u = st.session_state.get("idx_woj"); idx_pow_u = st.session_state.get("idx_powiat"); idx_gmi_u = st.session_state.get("idx_gmina")
+                if idx_woj_u:
+                    w = idx_woj_u.lookup(slat, slon)
+                    if w:
+                        out_rec["Voivodeship"] = w.get("name")
+                        out_rec["Voivodeship Code"] = w.get("code")
+                        have_official = True
+                if idx_pow_u:
+                    p = idx_pow_u.lookup(slat, slon)
+                    if p:
+                        out_rec["County"] = p.get("name")
+                        out_rec["County Code"] = p.get("code")
+                        have_official = True
+                if idx_gmi_u:
+                    g = idx_gmi_u.lookup(slat, slon)
+                    if g:
+                        out_rec["Municipality"] = g.get("name")
+                        out_rec["Municipality Code"] = g.get("code")
+                        have_official = True
+            except Exception as e:
+                log_rec["steps"].append({"error": f"Official admin lookup: {e}"})
+
+            if enrich_osm_admin and not have_official:
                 try:
                     adm = osm_reverse(slat, slon)
-                    out_rec["Municipality"] = adm.get("municipality") or None
-                    out_rec["Municipality Code"] = adm.get("municipality_code") or None
-                    out_rec["County"] = adm.get("county") or None
-                    out_rec["County Code"] = adm.get("county_code") or None
-                    out_rec["Voivodeship"] = adm.get("voivodeship") or None
-                    out_rec["Voivodeship Code"] = adm.get("voivodeship_code") or None
+                    out_rec["Municipality"] = adm.get("municipality") or out_rec.get("Municipality")
+                    out_rec["Municipality Code"] = adm.get("municipality_code") or out_rec.get("Municipality Code")
+                    out_rec["County"] = adm.get("county") or out_rec.get("County")
+                    out_rec["County Code"] = adm.get("county_code") or out_rec.get("County Code")
+                    out_rec["Voivodeship"] = adm.get("voivodeship") or out_rec.get("Voivodeship")
+                    out_rec["Voivodeship Code"] = adm.get("voivodeship_code") or out_rec.get("Voivodeship Code")
                 except Exception as e:
                     log_rec["steps"].append({"error": f"OSM admin reverse: {e}"})
+
         except Exception as e:
             log_rec["steps"].append({"fatal": str(e)})
 
@@ -506,17 +602,16 @@ def process_batch(
         if progress_hook:
             progress_hook(f"Processed {len(results)}/{total}")
 
-    # After loop
     st.session_state["route_cache"] = route_cache
     df_res = pd.DataFrame(results)
     return df_res, logs, api_calls
 
-# ---------------------- UI ----------------------
+# ---------------------- UI helpers ----------------------
 
 def sidebar():
     st.sidebar.header("Settings")
 
-    # Datasets status
+    # Dataset status
     with st.sidebar.expander("Datasets status", expanded=False):
         if _HAS_SHAPELY:
             idx = load_nuts3_index()
@@ -526,6 +621,10 @@ def sidebar():
                 st.markdown(f"**NUTS-3 polygons**: not loaded — {idx.get('msg', '')}")
         else:
             st.markdown("**NUTS-3 polygons**: Shapely not installed")
+        oa = st.session_state.get("official_admin", {})
+        st.markdown(f"**Official LAU (gmina)**: {'ready' if oa.get('gmina') else 'not available'}")
+        st.markdown(f"**Official ADM2 (powiat)**: {'ready' if oa.get('powiat') else 'not available'}")
+        st.markdown(f"**Official ADM1 (woj.)**: {'ready' if oa.get('woj') else 'not available'}")
         st.markdown("**OSM/Nominatim**: live reverse geocoding per site")
 
     # NUTS-3 tester
@@ -537,9 +636,9 @@ def sidebar():
             if res:
                 st.success(f"{res.get('NUTS_ID')} — {res.get('NAME_LATN')}")
             else:
-                st.warning("No NUTS-3 match (check Shapely install and dataset status)")
+                st.warning("No NUTS-3 match (check Shapely and dataset status)")
 
-    # OpenStreetMap reference search (no API key required)
+    # OSM reference search
     ref_search = st.sidebar.text_input("Search reference by name (OpenStreetMap)", value="")
     if st.sidebar.button("Search & select reference") and ref_search.strip():
         preds = osm_search(ref_search.strip(), limit=8)
@@ -690,17 +789,7 @@ def main():
         "optional reference location, and admin enrichment."
     )
 
-    (
-        topn,
-        pause_every,
-        pause_secs,
-        use_ref,
-        ref_name,
-        ref_lat,
-        ref_lon,
-        enrich_nuts3,
-        enrich_osm_admin,
-    ) = sidebar()
+    (topn, pause_every, pause_secs, use_ref, ref_name, ref_lat, ref_lon, enrich_nuts3, enrich_osm_admin,) = sidebar()
 
     download_buttons_area()
 
@@ -716,9 +805,7 @@ def main():
             st.error("Uploaded files must contain at least one row in each sheet.")
             return
 
-        status = st.empty()
-        pbar = st.progress(0)
-        total = len(sites_df)
+        status = st.empty(); pbar = st.progress(0); total = len(sites_df)
 
         def progress_hook(msg: str):
             if "Processed" in msg:
@@ -732,59 +819,29 @@ def main():
 
         try:
             df_res, logs, api_calls = process_batch(
-                sites_df,
-                airports_df,
-                seaports_df,
-                topn=int(topn),
-                include_ref=use_ref,
-                ref_lat=float(ref_lat),
-                ref_lon=float(ref_lon),
-                pause_every=int(pause_every),
-                pause_secs=float(pause_secs),
-                progress_hook=progress_hook,
-                enrich_nuts3=enrich_nuts3,
-                enrich_osm_admin=enrich_osm_admin,
+                sites_df, airports_df, seaports_df,
+                topn=int(topn), include_ref=use_ref, ref_lat=float(ref_lat), ref_lon=float(ref_lon),
+                pause_every=int(pause_every), pause_secs=float(pause_secs), progress_hook=progress_hook,
+                enrich_nuts3=enrich_nuts3, enrich_osm_admin=enrich_osm_admin,
             )
 
-            st.success(
-                f"Completed. API calls: {api_calls}. Cached routes: {len(st.session_state.get('route_cache', {}))}."
-            )
+            st.success(f"Completed. API calls: {api_calls}. Cached routes: {len(st.session_state.get('route_cache', {}))}.")
             if api_calls == 0:
                 st.warning("No successful routing calls. See Processing log below.")
 
-            # Rename reference columns to user label if changed
             if use_ref:
-                df_res = df_res.rename(
-                    columns={
-                        f"Distance to {DEFAULT_REF['name']} (km)": f"Distance to {ref_name} (km)",
-                        f"Time to {DEFAULT_REF['name']} (min)": f"Time to {ref_name} (min)",
-                    }
-                )
+                df_res = df_res.rename(columns={
+                    f"Distance to {DEFAULT_REF['name']} (km)": f"Distance to {ref_name} (km)",
+                    f"Time to {DEFAULT_REF['name']} (min)": f"Time to {ref_name} (min)",
+                })
 
-            # Order columns for display
             cols = [
-                "Site Name",
-                "Latitude",
-                "Longitude",
-                "Nearest Airport",
-                "Distance to Airport (km)",
-                "Time to Airport (min)",
-                "Nearest Seaport",
-                "Distance to Seaport (km)",
-                "Time to Seaport (min)",
-                "NUTS3 Code",
-                "NUTS3 Name",
-                "Municipality",
-                "Municipality Code",
-                "County",
-                "County Code",
-                "Voivodeship",
-                "Voivodeship Code",
+                "Site Name","Latitude","Longitude","Nearest Airport","Distance to Airport (km)","Time to Airport (min)",
+                "Nearest Seaport","Distance to Seaport (km)","Time to Seaport (min)",
+                "NUTS3 Code","NUTS3 Name","Municipality","Municipality Code","County","County Code","Voivodeship","Voivodeship Code",
             ]
             if use_ref:
                 cols += [f"Distance to {ref_name} (km)", f"Time to {ref_name} (min)"]
-
-            # Only keep columns that exist (defensive)
             cols = [c for c in cols if c in df_res.columns]
             df_res = df_res[cols]
 
@@ -796,20 +853,15 @@ def main():
                 for rec in logs:
                     st.write(f"### {rec['site']}")
                     for step in rec["steps"]:
-                        if "msg" in step:
-                            st.write("- " + step["msg"])
-                        if "error" in step:
-                            st.error("- " + step["error"])
-                        if "fatal" in step:
-                            st.error("FATAL: " + step["fatal"])
+                        if "msg" in step: st.write("- " + step["msg"])
+                        if "error" in step: st.error("- " + step["error"])
+                        if "fatal" in step: st.error("FATAL: " + step["fatal"])
 
             if st.checkbox("Show map preview (optional)"):
                 maybe_map(df_res, airports_df, seaports_df)
 
             if enrich_nuts3 and not _HAS_SHAPELY:
-                st.warning(
-                    "NUTS3 enrichment requested but Shapely is not installed. Add 'shapely>=2.0' to requirements.txt."
-                )
+                st.warning("NUTS3 enrichment requested but Shapely is not installed. Add 'shapely>=2.0' to requirements.txt.")
 
         except Exception as e:
             st.error(f"Processing failed: {e}")
