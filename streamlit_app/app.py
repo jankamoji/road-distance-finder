@@ -43,7 +43,7 @@ REQUIRED_AIRPORTS_COLS = ["Airport Name", "Latitude", "Longitude"]
 REQUIRED_SEAPORTS_COLS = ["Seaport Name", "Latitude", "Longitude"]
 
 # Enrichment toggles
-ENRICH_DEFAULT_NUTS3 = True
+ENRICH_DEFAULT_NUTS3 = False  # NUTS disabled by default; use national admin sources instead
 ENRICH_DEFAULT_OSM_ADMIN = True
 
 # ---------------------- Utilities ----------------------
@@ -102,7 +102,9 @@ def template_files() -> Dict[str, bytes]:
 
     return out
 
-# ---------------------- NUTS-3 (EU GISCO) ----------------------
+# ---------------------- NUTS-3 (disabled by default) ----------------------
+# We keep the implementation for optional use/testing, but NUTS-3 is not
+# used by default because results should match national administrative units.
 
 NUTS3_URL = (
     "https://gisco-services.ec.europa.eu/distribution/v2/nuts/geojson/"
@@ -148,7 +150,6 @@ def load_nuts3_index() -> Dict[str, Any]:
 
 
 def nuts3_lookup(lat: float, lon: float) -> Dict[str, Any]:
-    """Robust point-in-polygon lookup for NUTS-3."""
     idx = load_nuts3_index()
     if not idx.get("ok"):
         return {}
@@ -170,18 +171,10 @@ def nuts3_lookup(lat: float, lon: float) -> Dict[str, Any]:
                     return idx["props"][ix]
         except Exception:
             continue
-    try:
-        for ix, g in enumerate(idx["geoms"]):
-            try:
-                if g.covers(pt) or g.contains(pt) or g.intersects(pt):
-                    return idx["props"][ix]
-            except Exception:
-                continue
-    except Exception:
-        pass
-    return {}
+    return {}  # keep minimal fallback
 
 # ---------------------- OSM Reverse Geocoding ----------------------
+
 
 NOMINATIM_REVERSE = "https://nominatim.openstreetmap.org/reverse"
 
@@ -271,37 +264,11 @@ def osm_search(query: str, limit: int = 5) -> List[Dict[str, Any]]:
     except Exception:
         return []
 
-# ---------------------- Official Polish admin polygons (auto + optional upload) ----------------------
-# We auto-fetch official WFS GeoJSON from Polish Geoportal PRG for: gminy, powiaty, województwa.
+# ---------------------- National admin polygons (auto/URL/upload per country) ----------------------
+# EU-wide support based on national sources where possible. We ship an auto-loader for PL
+# and a generic URL/uploader path for any country. Everything is cached in-session.
 
-@st.cache_resource(show_spinner=False)
-def load_official_admin_indices() -> Dict[str, Any]:
-    if not _HAS_SHAPELY:
-        return {}
-    urls = {
-        "gmina": "https://mapy.geoportal.gov.pl/wss/service/PZGIK/PRG/WFS/AdministrativeBoundaries?SERVICE=WFS&VERSION=2.0.0&REQUEST=GetFeature&TYPENAMES=prg:gminy&OUTPUTFORMAT=application/json",
-        "powiat": "https://mapy.geoportal.gov.pl/wss/service/PZGIK/PRG/WFS/AdministrativeBoundaries?SERVICE=WFS&VERSION=2.0.0&REQUEST=GetFeature&TYPENAMES=prg:powiaty&OUTPUTFORMAT=application/json",
-        "woj": "https://mapy.geoportal.gov.pl/wss/service/PZGIK/PRG/WFS/AdministrativeBoundaries?SERVICE=WFS&VERSION=2.0.0&REQUEST=GetFeature&TYPENAMES=prg:wojewodztwa&OUTPUTFORMAT=application/json",
-    }
-    out: Dict[str, Any] = {}
-    for level, url in urls.items():
-        try:
-            r = requests.get(url, timeout=60)
-            r.raise_for_status()
-            gj = r.json()
-            idx = build_admin_index_from_geojson(
-                gj,
-                code_field="JPT_KOD_JE",
-                name_field="JPT_NAZWA_",
-                alt_code_fields=["TERYT", "TERC"],
-                alt_name_fields=["NAZWA"],
-            )
-            if idx:
-                out[level] = idx
-        except Exception:
-            continue
-    return out
-
+# Helper stays the same
 class AdminIndex:
     def __init__(self, geoms: List[Any], props: List[Dict[str, Any]]):
         self.geoms = geoms
@@ -368,9 +335,50 @@ def build_admin_index_from_geojson(gj: Dict[str, Any], code_field: str, name_fie
     except Exception:
         return None
 
-# Put auto indices into session once
+# Pre-wired auto for PL (PRG WFS)
+@st.cache_resource(show_spinner=False)
+def load_official_PL() -> Dict[str, Any]:
+    if not _HAS_SHAPELY:
+        return {}
+    urls = {
+        "gmina": "https://mapy.geoportal.gov.pl/wss/service/PZGIK/PRG/WFS/AdministrativeBoundaries?SERVICE=WFS&VERSION=2.0.0&REQUEST=GetFeature&TYPENAMES=prg:gminy&OUTPUTFORMAT=application/json",
+        "powiat": "https://mapy.geoportal.gov.pl/wss/service/PZGIK/PRG/WFS/AdministrativeBoundaries?SERVICE=WFS&VERSION=2.0.0&REQUEST=GetFeature&TYPENAMES=prg:powiaty&OUTPUTFORMAT=application/json",
+        "woj": "https://mapy.geoportal.gov.pl/wss/service/PZGIK/PRG/WFS/AdministrativeBoundaries?SERVICE=WFS&VERSION=2.0.0&REQUEST=GetFeature&TYPENAMES=prg:wojewodztwa&OUTPUTFORMAT=application/json",
+    }
+    out: Dict[str, Any] = {}
+    for level, url in urls.items():
+        try:
+            r = requests.get(url, timeout=60)
+            r.raise_for_status()
+            gj = r.json()
+            idx = build_admin_index_from_geojson(
+                gj,
+                code_field="JPT_KOD_JE",
+                name_field="JPT_NAZWA_",
+                alt_code_fields=["TERYT", "TERC"],
+                alt_name_fields=["NAZWA"],
+            )
+            if idx:
+                out[level] = idx
+        except Exception:
+            continue
+    return out
+
+# Session init
 if "official_admin" not in st.session_state:
-    st.session_state["official_admin"] = load_official_admin_indices()
+    st.session_state["official_admin"] = load_official_PL()
+    st.session_state["official_admin_country"] = "PL"
+
+# Helper to load from arbitrary URL
+@st.cache_resource(show_spinner=False)
+def load_index_from_url(url: str, code_field: str, name_field: str, alt_code_fields: List[str] | None = None, alt_name_fields: List[str] | None = None) -> AdminIndex | None:
+    try:
+        r = requests.get(url, timeout=90)
+        r.raise_for_status()
+        gj = r.json()
+        return build_admin_index_from_geojson(gj, code_field, name_field, alt_code_fields, alt_name_fields)
+    except Exception:
+        return None
 
 # ---------------------- Validation ----------------------
 
@@ -442,14 +450,13 @@ def process_batch(
             "Latitude": round(slat, 6),
             "Longitude": round(slon, 6),
             "Nearest Airport": None,
+            "Nearest Airport Code": None,
             "Distance to Airport (km)": None,
             "Time to Airport (min)": None,
             "Nearest Seaport": None,
             "Distance to Seaport (km)": None,
             "Time to Seaport (min)": None,
-            "NUTS3 Code": None,
-            "NUTS3 Name": None,
-            "Municipality": None,
+                        "Municipality": None,
             "Municipality Code": None,
             "County": None,
             "County Code": None,
@@ -483,6 +490,7 @@ def process_batch(
                     log_rec["steps"].append({"error": f"Airport '{a['Airport Name']}': {e}"})
             if best_air is not None:
                 out_rec["Nearest Airport"] = str(best_air.get("Airport Name"))
+                out_rec["Nearest Airport Code"] = str(best_air.get("IATA") or best_air.get("ICAO") or best_air.get("Code") or "")
                 out_rec["Distance to Airport (km)"] = round(best_air_d, 1)
                 out_rec["Time to Airport (min)"] = round(best_air_t, 1)
 
@@ -526,15 +534,6 @@ def process_batch(
                     log_rec["steps"].append({"error": f"Reference: {e}"})
 
             # Enrichment
-            if enrich_nuts3 and _HAS_SHAPELY:
-                try:
-                    n = nuts3_lookup(lat=slat, lon=slon)
-                    if n:
-                        out_rec["NUTS3 Code"] = n.get("NUTS_ID")
-                        out_rec["NUTS3 Name"] = n.get("NAME_LATN")
-                except Exception as e:
-                    log_rec["steps"].append({"error": f"NUTS3 lookup: {e}"})
-
             # Prefer official polygons (auto first, then user override), then OSM fallback
             have_official = False
             try:
@@ -613,30 +612,13 @@ def sidebar():
 
     # Dataset status
     with st.sidebar.expander("Datasets status", expanded=False):
-        if _HAS_SHAPELY:
-            idx = load_nuts3_index()
-            if idx.get("ok"):
-                st.markdown(f"**NUTS-3 polygons**: loaded ({idx.get('count', 0)} features)")
-            else:
-                st.markdown(f"**NUTS-3 polygons**: not loaded — {idx.get('msg', '')}")
-        else:
-            st.markdown("**NUTS-3 polygons**: Shapely not installed")
+        active_iso = st.session_state.get("official_admin_country", "PL")
+        st.markdown(f"**Active national source**: `{active_iso}`")
         oa = st.session_state.get("official_admin", {})
-        st.markdown(f"**Official LAU (gmina)**: {'ready' if oa.get('gmina') else 'not available'}")
-        st.markdown(f"**Official ADM2 (powiat)**: {'ready' if oa.get('powiat') else 'not available'}")
-        st.markdown(f"**Official ADM1 (woj.)**: {'ready' if oa.get('woj') else 'not available'}")
-        st.markdown("**OSM/Nominatim**: live reverse geocoding per site")
-
-    # NUTS-3 tester
-    with st.sidebar.expander("NUTS-3 tester", expanded=False):
-        t_lat = st.number_input("Lat", value=DEFAULT_REF["lat"], format="%.6f", key="nuts_t_lat")
-        t_lon = st.number_input("Lon", value=DEFAULT_REF["lon"], format="%.6f", key="nuts_t_lon")
-        if st.button("Test NUTS lookup"):
-            res = nuts3_lookup(lat=float(t_lat), lon=float(t_lon)) if _HAS_SHAPELY else {}
-            if res:
-                st.success(f"{res.get('NUTS_ID')} — {res.get('NAME_LATN')}")
-            else:
-                st.warning("No NUTS-3 match (check Shapely and dataset status)")
+        st.markdown(f"**Official LAU / municipalities**: {'ready' if oa.get('gmina') else 'not available'}")
+        st.markdown(f"**Official counties**: {'ready' if oa.get('powiat') else 'not available'}")
+        st.markdown(f"**Official regions**: {'ready' if oa.get('woj') else 'not available'}")
+        st.markdown("**OSM/Nominatim**: fallback reverse geocoding per site")
 
     # OSM reference search
     ref_search = st.sidebar.text_input("Search reference by name (OpenStreetMap)", value="")
@@ -664,8 +646,7 @@ def sidebar():
     topn = st.sidebar.number_input("Top-N candidates by Haversine", min_value=1, max_value=20, value=3, step=1)
 
     st.sidebar.subheader("Admin enrichment")
-    enrich_nuts3 = st.sidebar.checkbox("Add NUTS-3 (EU GISCO)", value=ENRICH_DEFAULT_NUTS3)
-    enrich_osm_admin = st.sidebar.checkbox("Add municipality/county/voivodeship (OSM)", value=ENRICH_DEFAULT_OSM_ADMIN)
+    enrich_osm_admin = st.sidebar.checkbox("Add municipality/county/region (national sources; OSM fallback)", value=ENRICH_DEFAULT_OSM_ADMIN)
 
     st.sidebar.subheader("Rate limiting")
     pause_every = st.sidebar.number_input("Pause after X API calls", min_value=0, max_value=500, value=0, step=1,
@@ -680,6 +661,33 @@ def sidebar():
             st.sidebar.success(f"Test OK: {dist_km:.1f} km, {dur_min:.0f} min")
         except Exception as e:
             st.sidebar.error(f"Test failed: {e}")
+
+    st.sidebar.subheader("Official admin datasets (national)")
+    iso2 = st.sidebar.text_input("Country ISO-2 (e.g., PL, CZ, DE, FR)", value=st.session_state.get("official_admin_country", "PL"), max_chars=2).upper()
+
+    with st.sidebar.expander("Load from URLs (GeoJSON)"):
+        url_g = st.text_input("Municipalities (GeoJSON URL)", value="")
+        url_p = st.text_input("Counties (GeoJSON URL)", value="")
+        url_w = st.text_input("Regions (GeoJSON URL)", value="")
+        code_field = st.text_input("Code field (e.g., TERC/LAU_ID)", value="")
+        name_field = st.text_input("Name field (e.g., NAME/JPT_NAZWA_)", value="")
+        if st.button("Load from URLs") and code_field and name_field:
+            new_idx = {}
+            if url_g:
+                idxg = load_index_from_url(url_g, code_field, name_field)
+                if idxg: new_idx["gmina"] = idxg
+            if url_p:
+                idxp = load_index_from_url(url_p, code_field, name_field)
+                if idxp: new_idx["powiat"] = idxp
+            if url_w:
+                idxw = load_index_from_url(url_w, code_field, name_field)
+                if idxw: new_idx["woj"] = idxw
+            if new_idx:
+                st.session_state["official_admin"] = new_idx
+                st.session_state["official_admin_country"] = iso2
+                st.success("Loaded admin layers from provided URLs.")
+            else:
+                st.warning("No layers loaded from URLs.")
 
     st.sidebar.subheader("Cache")
     if st.sidebar.button("Clear route cache"):
@@ -828,6 +836,11 @@ def main():
             st.success(f"Completed. API calls: {api_calls}. Cached routes: {len(st.session_state.get('route_cache', {}))}.")
             if api_calls == 0:
                 st.warning("No successful routing calls. See Processing log below.")
+            # ensure airport code column appears after airport name
+            try:
+                cols.insert(cols.index("Nearest Airport")+1, "Nearest Airport Code")
+            except Exception:
+                pass
 
             if use_ref:
                 df_res = df_res.rename(columns={
@@ -838,7 +851,7 @@ def main():
             cols = [
                 "Site Name","Latitude","Longitude","Nearest Airport","Distance to Airport (km)","Time to Airport (min)",
                 "Nearest Seaport","Distance to Seaport (km)","Time to Seaport (min)",
-                "NUTS3 Code","NUTS3 Name","Municipality","Municipality Code","County","County Code","Voivodeship","Voivodeship Code",
+                "Municipality","Municipality Code","County","County Code","Voivodeship","Voivodeship Code",
             ]
             if use_ref:
                 cols += [f"Distance to {ref_name} (km)", f"Time to {ref_name} (min)"]
