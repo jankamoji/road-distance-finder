@@ -879,12 +879,12 @@ def main():
                         if "error" in step: st.error("- " + step["error"])
                         if "fatal" in step: st.error("FATAL: " + step["fatal"])
 
-           if st.checkbox("Show map preview (optional)"):
+            if st.checkbox("Show map preview (optional)"):
                     maybe_map(df_res, airports_df, seaports_df)
                 
-           # Optional warning if NO shapely and NO national admin indices (pure OSM fallback)
-           if not _HAS_SHAPELY and not st.session_state.get("official_admin"):
-                    st.warning("Shapely not installed and no national admin indices loaded; only OSM reverse will be used.")
+            # Optional warning if NO shapely and NO national admin indices (pure OSM fallback)
+            if not _HAS_SHAPELY and not st.session_state.get("official_admin"):
+                st.warning("Shapely not installed and no national admin indices loaded; only OSM reverse will be used.")
 
 
         except Exception as e:
