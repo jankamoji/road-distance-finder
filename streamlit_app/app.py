@@ -694,7 +694,7 @@ def sidebar():
         st.session_state["route_cache"] = {}
         st.sidebar.success("Route cache cleared")
 
-    return topn, pause_every, pause_secs, use_ref, ref_name, float(st.session_state.get("ref_lat", DEFAULT_REF['lat'])), float(st.session_state.get("ref_lon", DEFAULT_REF['lon'])), enrich_nuts3, enrich_osm_admin
+    return topn, pause_every, pause_secs, use_ref, ref_name, float(st.session_state.get("ref_lat", DEFAULT_REF['lat'])), float(st.session_state.get("ref_lon", DEFAULT_REF['lon'])), enrich_osm_admin
 
 
 def download_buttons_area():
@@ -797,7 +797,7 @@ def main():
         "optional reference location, and admin enrichment."
     )
 
-    (topn, pause_every, pause_secs, use_ref, ref_name, ref_lat, ref_lon, enrich_nuts3, enrich_osm_admin,) = sidebar()
+    (topn, pause_every, pause_secs, use_ref, ref_name, ref_lat, ref_lon, enrich_osm_admin) = sidebar()
 
     download_buttons_area()
 
@@ -828,7 +828,7 @@ def main():
         try:
             df_res, logs, api_calls = process_batch(
                 sites_df, airports_df, seaports_df,
-                topn=int(topn), include_ref=use_ref, ref_lat=float(ref_lat), ref_lon=float(ref_lon),
+                topn=int(topn, enrich_nuts3=False, enrich_osm_admin=enrich_osm_admin,), include_ref=use_ref, ref_lat=float(ref_lat), ref_lon=float(ref_lon),
                 pause_every=int(pause_every), pause_secs=float(pause_secs), progress_hook=progress_hook,
                 enrich_nuts3=enrich_nuts3, enrich_osm_admin=enrich_osm_admin,
             )
