@@ -1,7 +1,13 @@
 # app.py — Road Distance Finder (Streamlit)
-# Final, deployable version: distances via OSRM, OSM search/reverse, Top-N prefilter,
-# NUTS-3 enrichment (GISCO) and **official Polish admin polygons auto-loaded** (LAU/ADM1/ADM2).
-# Also supports optional user uploads to override the official layers.
+# Fully deployable version
+# Features
+# - Upload Sites/Airports/Seaports Excel templates
+# - Top-N Haversine prefilter, then OSRM routing for nearest-by-road airport & seaport + optional reference
+# - Progress bar, quota pausing, per-site logs, memoized route cache
+# - OSM forward search for reference; reverse for admin fallback
+# - National admin enrichment (PL auto via PRG/WFS + generic GeoJSON URL loader)
+# - EU NUTS-2 & NUTS-3 enrichment (GISCO) in addition to national units
+# - Results table + CSV/XLSX downloads; optional map preview
 
 import io
 import time
@@ -27,7 +33,7 @@ try:
 except Exception:
     _HAS_MAP = False
 
-# Shapely for geometry / NUTS & admin polygons
+# Geometry stack (required for admin/NUTS)
 try:
     from shapely.geometry import shape, Point  # type: ignore
     from shapely.strtree import STRtree  # type: ignore
@@ -39,24 +45,21 @@ except Exception:
 APP_TITLE = "Road Distance Finder"
 DEFAULT_REF = {"name": "Bedburg, Germany", "lat": 51.0126, "lon": 6.5741}
 REQUIRED_SITES_COLS = ["Site Name", "Latitude", "Longitude"]
-REQUIRED_AIRPORTS_COLS = ["Airport Name", "Latitude", "Longitude"]
-REQUIRED_SEAPORTS_COLS = ["Seaport Name", "Latitude", "Longitude"]
+REQUIRED_AIRPORTS_COLS = ["Airport Name", "Latitude", "Longitude"]  # IATA optional
+REQUIRED_SEAPORTS_COLS = ["Seaport Name", "Latitude", "Longitude"]  # UNLOCODE optional
 
-# Enrichment toggles
-ENRICH_DEFAULT_NUTS3 = False  # NUTS disabled by default; use national admin sources instead
-ENRICH_DEFAULT_OSM_ADMIN = True
+ENRICH_DEFAULT_OSM_ADMIN = True  # OSM fallback
 
 # ---------------------- Utilities ----------------------
 
 def haversine_km(lat1, lon1, lat2, lon2):
-    """Vectorized haversine distance in km between arrays lat1/lon1 and lat2/lon2."""
     R = 6371.0088
     phi1 = np.radians(lat1)
     phi2 = np.radians(lat2)
     dphi = np.radians(lat2 - lat1)
     dlambda = np.radians(lon2 - lon1)
-    a = np.sin(dphi / 2.0) ** 2 + np.cos(phi1) * np.cos(phi2) * np.sin(dlambda / 2.0) ** 2
-    c = 2 * np.arctan2(np.sqrt(a), np.sqrt(1 - a))
+    a = np.sin(dphi/2.0)**2 + np.cos(phi1) * np.cos(phi2) * np.sin(dlambda/2.0)**2
+    c = 2 * np.arctan2(np.sqrt(a), np.sqrt(1-a))
     return R * c
 
 @st.cache_data(show_spinner=False)
@@ -102,21 +105,16 @@ def template_files() -> Dict[str, bytes]:
 
     return out
 
-# ---------------------- NUTS-3 (disabled by default) ----------------------
-# We keep the implementation for optional use/testing, but NUTS-3 is not
-# used by default because results should match national administrative units.
-
-NUTS3_URL = (
-    "https://gisco-services.ec.europa.eu/distribution/v2/nuts/geojson/"
-    "NUTS_RG_01M_2021_4326_LEVL_3.geojson"
-)
+# ---------------------- NUTS (EU GISCO) — always enrich NUTS2 & NUTS3 ----------------------
+NUTS2_URL = "https://gisco-services.ec.europa.eu/distribution/v2/nuts/geojson/NUTS_RG_01M_2021_4326_LEVL_2.geojson"
+NUTS3_URL = "https://gisco-services.ec.europa.eu/distribution/v2/nuts/geojson/NUTS_RG_01M_2021_4326_LEVL_3.geojson"
 
 @st.cache_resource(show_spinner=False)
-def load_nuts3_index() -> Dict[str, Any]:
+def _load_nuts_index(url: str) -> Dict[str, Any]:
     if not _HAS_SHAPELY:
         return {"ok": False, "msg": "Shapely not installed", "tree": None, "geoms": [], "props": [], "wkb2ix": {}, "count": 0}
     try:
-        r = requests.get(NUTS3_URL, timeout=60)
+        r = requests.get(url, timeout=60)
         r.raise_for_status()
         gj = r.json()
         geoms: List[Any] = []
@@ -133,6 +131,7 @@ def load_nuts3_index() -> Dict[str, Any]:
                 props.append({
                     "NUTS_ID": pr.get("NUTS_ID"),
                     "NAME_LATN": pr.get("NAME_LATN"),
+                    "LEVL_CODE": pr.get("LEVL_CODE"),
                     "CNTR_CODE": pr.get("CNTR_CODE"),
                 })
                 try:
@@ -148,9 +147,16 @@ def load_nuts3_index() -> Dict[str, Any]:
     except Exception as e:
         return {"ok": False, "msg": str(e), "tree": None, "geoms": [], "props": [], "wkb2ix": {}, "count": 0}
 
+@st.cache_resource(show_spinner=False)
+def load_nuts2_index() -> Dict[str, Any]:
+    return _load_nuts_index(NUTS2_URL)
 
-def nuts3_lookup(lat: float, lon: float) -> Dict[str, Any]:
-    idx = load_nuts3_index()
+@st.cache_resource(show_spinner=False)
+def load_nuts3_index() -> Dict[str, Any]:
+    return _load_nuts_index(NUTS3_URL)
+
+
+def _nuts_lookup_generic(idx: Dict[str, Any], lat: float, lon: float) -> Dict[str, Any]:
     if not idx.get("ok"):
         return {}
     pt = Point(float(lon), float(lat))
@@ -171,11 +177,17 @@ def nuts3_lookup(lat: float, lon: float) -> Dict[str, Any]:
                     return idx["props"][ix]
         except Exception:
             continue
-    return {}  # keep minimal fallback
+    return {}
+
+@st.cache_data(show_spinner=False)
+def nuts2_lookup(lat: float, lon: float) -> Dict[str, Any]:
+    return _nuts_lookup_generic(load_nuts2_index(), lat, lon)
+
+@st.cache_data(show_spinner=False)
+def nuts3_lookup(lat: float, lon: float) -> Dict[str, Any]:
+    return _nuts_lookup_generic(load_nuts3_index(), lat, lon)
 
 # ---------------------- OSM Reverse Geocoding ----------------------
-
-
 NOMINATIM_REVERSE = "https://nominatim.openstreetmap.org/reverse"
 
 @st.cache_data(show_spinner=False)
@@ -206,7 +218,6 @@ def osm_reverse(lat: float, lon: float) -> Dict[str, Any]:
         return {"municipality": "", "municipality_code": "", "county": "", "county_code": "", "voivodeship": "", "voivodeship_code": ""}
 
 # ---------------------- Routing (OSRM) ----------------------
-
 OSRM_URL = (
     "https://router.project-osrm.org/route/v1/driving/"
     "{lon1},{lat1};{lon2},{lat2}?overview=false&annotations=duration,distance"
@@ -241,7 +252,6 @@ def get_route(origin: Tuple[float, float], dest: Tuple[float, float], route_cach
     return dist_km, dur_min
 
 # ---------------------- OSM forward search ----------------------
-
 NOMINATIM_SEARCH = "https://nominatim.openstreetmap.org/search"
 
 @st.cache_data(show_spinner=False)
@@ -264,11 +274,7 @@ def osm_search(query: str, limit: int = 5) -> List[Dict[str, Any]]:
     except Exception:
         return []
 
-# ---------------------- National admin polygons (auto/URL/upload per country) ----------------------
-# EU-wide support based on national sources where possible. We ship an auto-loader for PL
-# and a generic URL/uploader path for any country. Everything is cached in-session.
-
-# Helper stays the same
+# ---------------------- National admin polygons (PL auto + URL loader) ----------------------
 class AdminIndex:
     def __init__(self, geoms: List[Any], props: List[Dict[str, Any]]):
         self.geoms = geoms
@@ -335,7 +341,6 @@ def build_admin_index_from_geojson(gj: Dict[str, Any], code_field: str, name_fie
     except Exception:
         return None
 
-# Pre-wired auto for PL (PRG WFS)
 @st.cache_resource(show_spinner=False)
 def load_official_PL() -> Dict[str, Any]:
     if not _HAS_SHAPELY:
@@ -364,12 +369,11 @@ def load_official_PL() -> Dict[str, Any]:
             continue
     return out
 
-# Session init
+# session init for national admin
 if "official_admin" not in st.session_state:
     st.session_state["official_admin"] = load_official_PL()
     st.session_state["official_admin_country"] = "PL"
 
-# Helper to load from arbitrary URL
 @st.cache_resource(show_spinner=False)
 def load_index_from_url(url: str, code_field: str, name_field: str, alt_code_fields: List[str] | None = None, alt_name_fields: List[str] | None = None) -> AdminIndex | None:
     try:
@@ -409,7 +413,7 @@ def process_batch(
     pause_every: int,
     pause_secs: float,
     progress_hook=None,
-    enrich_nuts3: bool = ENRICH_DEFAULT_NUTS3,
+    enrich_nuts3: bool = True,  # kept for signature; not used directly
     enrich_osm_admin: bool = ENRICH_DEFAULT_OSM_ADMIN,
 ) -> Tuple[pd.DataFrame, List[Dict[str, Any]], int]:
 
@@ -456,19 +460,23 @@ def process_batch(
             "Nearest Seaport": None,
             "Distance to Seaport (km)": None,
             "Time to Seaport (min)": None,
-                        "Municipality": None,
+            "Municipality": None,
             "Municipality Code": None,
             "County": None,
             "County Code": None,
             "Voivodeship": None,
             "Voivodeship Code": None,
+            "NUTS2 Code": None,
+            "NUTS2 Name": None,
+            "NUTS3 Code": None,
+            "NUTS3 Name": None,
         }
         if include_ref:
             out_rec[f"Distance to {DEFAULT_REF['name']} (km)"] = None
             out_rec[f"Time to {DEFAULT_REF['name']} (min)"] = None
 
         try:
-            # Airports
+            # Airports (Top-N by air)
             dists_a = haversine_km(slat, slon, a_lat, a_lon)
             idxs_a = np.argsort(dists_a)[: min(topn, len(airports))]
             cand_airports = airports.iloc[idxs_a].copy()
@@ -494,7 +502,7 @@ def process_batch(
                 out_rec["Distance to Airport (km)"] = round(best_air_d, 1)
                 out_rec["Time to Airport (min)"] = round(best_air_t, 1)
 
-            # Seaports
+            # Seaports (Top-N by air)
             dists_p = haversine_km(slat, slon, p_lat, p_lon)
             idxs_p = np.argsort(dists_p)[: min(topn, len(seaports))]
             cand_ports = seaports.iloc[idxs_p].copy()
@@ -533,8 +541,24 @@ def process_batch(
                 except Exception as e:
                     log_rec["steps"].append({"error": f"Reference: {e}"})
 
-            # Enrichment
-            # Prefer official polygons (auto first, then user override), then OSM fallback
+            # NUTS enrichment
+            if _HAS_SHAPELY:
+                try:
+                    n2 = nuts2_lookup(lat=slat, lon=slon)
+                    if n2:
+                        out_rec["NUTS2 Code"] = n2.get("NUTS_ID")
+                        out_rec["NUTS2 Name"] = n2.get("NAME_LATN")
+                except Exception as e:
+                    log_rec["steps"].append({"error": f"NUTS2 lookup: {e}"})
+                try:
+                    n3 = nuts3_lookup(lat=slat, lon=slon)
+                    if n3:
+                        out_rec["NUTS3 Code"] = n3.get("NUTS_ID")
+                        out_rec["NUTS3 Name"] = n3.get("NAME_LATN")
+                except Exception as e:
+                    log_rec["steps"].append({"error": f"NUTS3 lookup: {e}"})
+
+            # National polygons (auto) then OSM fallback
             have_official = False
             try:
                 auto = st.session_state.get("official_admin", {})
@@ -556,27 +580,6 @@ def process_batch(
                     if g:
                         out_rec["Municipality"] = g.get("name") or out_rec.get("Municipality")
                         out_rec["Municipality Code"] = g.get("code") or out_rec.get("Municipality Code")
-                        have_official = True
-
-                # User uploaded overrides (if you later add upload UI storing idx_* in session)
-                idx_woj_u = st.session_state.get("idx_woj"); idx_pow_u = st.session_state.get("idx_powiat"); idx_gmi_u = st.session_state.get("idx_gmina")
-                if idx_woj_u:
-                    w = idx_woj_u.lookup(slat, slon)
-                    if w:
-                        out_rec["Voivodeship"] = w.get("name")
-                        out_rec["Voivodeship Code"] = w.get("code")
-                        have_official = True
-                if idx_pow_u:
-                    p = idx_pow_u.lookup(slat, slon)
-                    if p:
-                        out_rec["County"] = p.get("name")
-                        out_rec["County Code"] = p.get("code")
-                        have_official = True
-                if idx_gmi_u:
-                    g = idx_gmi_u.lookup(slat, slon)
-                    if g:
-                        out_rec["Municipality"] = g.get("name")
-                        out_rec["Municipality Code"] = g.get("code")
                         have_official = True
             except Exception as e:
                 log_rec["steps"].append({"error": f"Official admin lookup: {e}"})
@@ -618,6 +621,10 @@ def sidebar():
         st.markdown(f"**Official LAU / municipalities**: {'ready' if oa.get('gmina') else 'not available'}")
         st.markdown(f"**Official counties**: {'ready' if oa.get('powiat') else 'not available'}")
         st.markdown(f"**Official regions**: {'ready' if oa.get('woj') else 'not available'}")
+        # NUTS datasets
+        n2 = load_nuts2_index(); n3 = load_nuts3_index()
+        st.markdown(f"**NUTS-2 polygons**: {'loaded ('+str(n2.get('count',0))+' features)' if n2.get('ok') else 'not loaded — '+n2.get('msg','')}")
+        st.markdown(f"**NUTS-3 polygons**: {'loaded ('+str(n3.get('count',0))+' features)' if n3.get('ok') else 'not loaded — '+n3.get('msg','')}")
         st.markdown("**OSM/Nominatim**: fallback reverse geocoding per site")
 
     # OSM reference search
@@ -648,20 +655,6 @@ def sidebar():
     st.sidebar.subheader("Admin enrichment")
     enrich_osm_admin = st.sidebar.checkbox("Add municipality/county/region (national sources; OSM fallback)", value=ENRICH_DEFAULT_OSM_ADMIN)
 
-    st.sidebar.subheader("Rate limiting")
-    pause_every = st.sidebar.number_input("Pause after X API calls", min_value=0, max_value=500, value=0, step=1,
-                                          help="OSRM demo has its own limits; pausing is usually unnecessary.")
-    pause_secs = st.sidebar.number_input("Pause duration (seconds)", min_value=0.0, max_value=120.0, value=0.0, step=5.0)
-
-    st.sidebar.subheader("Connectivity test (OSRM)")
-    if st.sidebar.button("Run quick routing test"):
-        try:
-            o = (DEFAULT_REF['lat'], DEFAULT_REF['lon']); d = (50.1109, 8.6821)  # Bedburg -> Frankfurt
-            dist_km, dur_min = route_via_osrm(o, d)
-            st.sidebar.success(f"Test OK: {dist_km:.1f} km, {dur_min:.0f} min")
-        except Exception as e:
-            st.sidebar.error(f"Test failed: {e}")
-
     st.sidebar.subheader("Official admin datasets (national)")
     iso2 = st.sidebar.text_input("Country ISO-2 (e.g., PL, CZ, DE, FR)", value=st.session_state.get("official_admin_country", "PL"), max_chars=2).upper()
 
@@ -688,6 +681,20 @@ def sidebar():
                 st.success("Loaded admin layers from provided URLs.")
             else:
                 st.warning("No layers loaded from URLs.")
+
+    st.sidebar.subheader("Rate limiting")
+    pause_every = st.sidebar.number_input("Pause after X API calls", min_value=0, max_value=500, value=0, step=1,
+                                          help="OSRM demo has its own limits; pausing is usually unnecessary.")
+    pause_secs = st.sidebar.number_input("Pause duration (seconds)", min_value=0.0, max_value=120.0, value=0.0, step=5.0)
+
+    st.sidebar.subheader("Connectivity test (OSRM)")
+    if st.sidebar.button("Run quick routing test"):
+        try:
+            o = (DEFAULT_REF['lat'], DEFAULT_REF['lon']); d = (50.1109, 8.6821)  # Bedburg -> Frankfurt
+            dist_km, dur_min = route_via_osrm(o, d)
+            st.sidebar.success(f"Test OK: {dist_km:.1f} km, {dur_min:.0f} min")
+        except Exception as e:
+            st.sidebar.error(f"Test failed: {e}")
 
     st.sidebar.subheader("Cache")
     if st.sidebar.button("Clear route cache"):
@@ -794,7 +801,7 @@ def main():
     st.title(APP_TITLE)
     st.caption(
         "Compute road distance/time from sites to nearest airport and container seaport (Top-N prefilter), "
-        "optional reference location, and admin enrichment."
+        "optional reference location, and national + NUTS enrichment."
     )
 
     (topn, pause_every, pause_secs, use_ref, ref_name, ref_lat, ref_lon, enrich_osm_admin) = sidebar()
@@ -837,19 +844,13 @@ def main():
                 pause_every=int(pause_every),
                 pause_secs=float(pause_secs),
                 progress_hook=progress_hook,
-                enrich_nuts3=False,                  # NUTS disabled
-                enrich_osm_admin=enrich_osm_admin,   # keep national/OSM enrichment
+                enrich_nuts3=True,
+                enrich_osm_admin=enrich_osm_admin,
             )
-
 
             st.success(f"Completed. API calls: {api_calls}. Cached routes: {len(st.session_state.get('route_cache', {}))}.")
             if api_calls == 0:
                 st.warning("No successful routing calls. See Processing log below.")
-            # ensure airport code column appears after airport name
-            try:
-                cols.insert(cols.index("Nearest Airport")+1, "Nearest Airport Code")
-            except Exception:
-                pass
 
             if use_ref:
                 df_res = df_res.rename(columns={
@@ -858,9 +859,11 @@ def main():
                 })
 
             cols = [
-                "Site Name","Latitude","Longitude","Nearest Airport","Distance to Airport (km)","Time to Airport (min)",
+                "Site Name","Latitude","Longitude",
+                "Nearest Airport","Nearest Airport Code","Distance to Airport (km)","Time to Airport (min)",
                 "Nearest Seaport","Distance to Seaport (km)","Time to Seaport (min)",
                 "Municipality","Municipality Code","County","County Code","Voivodeship","Voivodeship Code",
+                "NUTS2 Code","NUTS2 Name","NUTS3 Code","NUTS3 Name",
             ]
             if use_ref:
                 cols += [f"Distance to {ref_name} (km)", f"Time to {ref_name} (min)"]
@@ -880,12 +883,10 @@ def main():
                         if "fatal" in step: st.error("FATAL: " + step["fatal"])
 
             if st.checkbox("Show map preview (optional)"):
-                    maybe_map(df_res, airports_df, seaports_df)
-                
-            # Optional warning if NO shapely and NO national admin indices (pure OSM fallback)
+                maybe_map(df_res, airports_df, seaports_df)
+
             if not _HAS_SHAPELY and not st.session_state.get("official_admin"):
                 st.warning("Shapely not installed and no national admin indices loaded; only OSM reverse will be used.")
-
 
         except Exception as e:
             st.error(f"Processing failed: {e}")
