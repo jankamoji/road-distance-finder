@@ -827,11 +827,20 @@ def main():
 
         try:
             df_res, logs, api_calls = process_batch(
-                sites_df, airports_df, seaports_df,
-                topn=int(topn, enrich_nuts3=False, enrich_osm_admin=enrich_osm_admin,), include_ref=use_ref, ref_lat=float(ref_lat), ref_lon=float(ref_lon),
-                pause_every=int(pause_every), pause_secs=float(pause_secs), progress_hook=progress_hook,
-                enrich_nuts3=enrich_nuts3, enrich_osm_admin=enrich_osm_admin,
+                sites_df,
+                airports_df,
+                seaports_df,
+                topn=int(topn),
+                include_ref=use_ref,
+                ref_lat=float(ref_lat),
+                ref_lon=float(ref_lon),
+                pause_every=int(pause_every),
+                pause_secs=float(pause_secs),
+                progress_hook=progress_hook,
+                enrich_nuts3=False,                  # NUTS disabled
+                enrich_osm_admin=enrich_osm_admin,   # keep national/OSM enrichment
             )
+
 
             st.success(f"Completed. API calls: {api_calls}. Cached routes: {len(st.session_state.get('route_cache', {}))}.")
             if api_calls == 0:
