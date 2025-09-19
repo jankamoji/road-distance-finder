@@ -157,13 +157,25 @@ def load_nuts3_index() -> Dict[str, Any]:
 
 
 def _nuts_lookup_generic(idx: Dict[str, Any], lat: float, lon: float) -> Dict[str, Any]:
+    """Robust point-in-polygon for NUTS with Shapely 2 STRtree."""
     if not idx.get("ok"):
         return {}
     pt = Point(float(lon), float(lat))
+
+    # 1) Fast path: predicate-filtered query
     try:
-        cands = idx["tree"].query(pt)
+        cands = list(idx["tree"].query(pt, predicate="intersects"))
     except Exception:
         cands = []
+
+    # 2) Boundary-safe fallback: tiny buffer around the point
+    if not cands:
+        try:
+            cands = list(idx["tree"].query(pt.buffer(1e-9), predicate="intersects"))
+        except Exception:
+            cands = []
+
+    # 3) Verify with covers/contains and map to props
     for g in cands:
         try:
             if g.covers(pt) or g.contains(pt) or g.intersects(pt):
@@ -177,7 +189,9 @@ def _nuts_lookup_generic(idx: Dict[str, Any], lat: float, lon: float) -> Dict[st
                     return idx["props"][ix]
         except Exception:
             continue
+
     return {}
+
 
 @st.cache_data(show_spinner=False)
 def nuts2_lookup(lat: float, lon: float) -> Dict[str, Any]:
