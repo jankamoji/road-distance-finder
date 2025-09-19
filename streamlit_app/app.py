@@ -112,120 +112,274 @@ NUTS3_URL = "https://gisco-services.ec.europa.eu/distribution/v2/nuts/geojson/NU
 
 @st.cache_resource(show_spinner=False)
 def _load_nuts_index(url: str) -> Dict[str, Any]:
+    """Load NUTS geometries and build spatial index"""
     if not _HAS_SHAPELY:
-        return {"ok": False, "msg": "Shapely not installed", "tree": None, "geoms": [], "props": [], "wkb2ix": {}, "count": 0}
+        return {
+            "ok": False, 
+            "msg": "Shapely not installed", 
+            "tree": None, 
+            "geoms": [], 
+            "props": [], 
+            "count": 0
+        }
+    
     try:
-        r = requests.get(url, timeout=60)
-        r.raise_for_status()
-        gj = r.json()
-        geoms: List[Any] = []
-        props: List[Dict[str, Any]] = []
-        wkb2ix: Dict[bytes, int] = {}
+        # Download GeoJSON with retries
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                r = requests.get(url, timeout=120)
+                r.raise_for_status()
+                gj = r.json()
+                break
+            except requests.exceptions.Timeout:
+                if attempt == max_retries - 1:
+                    raise
+                time.sleep(2 ** attempt)  # exponential backoff
+            except Exception as e:
+                if attempt == max_retries - 1:
+                    raise
+        
+        geoms = []
+        props = []
+        
+        # Parse features
         for feat in gj.get("features", []):
-                try:
-                    g = shape(feat["geometry"])
-                    # repair invalid geometries (common in multi polygons / coastal tiles)
-                    if not g.is_valid:
-                        try:
-                            g = make_valid(g)
-                        except Exception:
-                            g = g.buffer(0)  # fallback
-                    if g.is_empty:
-                        continue
-                    ix = len(geoms)
-                    geoms.append(g)
-                    pr = feat.get("properties", {})
-                    props.append({
-                        "NUTS_ID": pr.get("NUTS_ID"),
-                        "NAME_LATN": pr.get("NAME_LATN"),
-                        "LEVL_CODE": pr.get("LEVL_CODE"),
-                        "CNTR_CODE": pr.get("CNTR_CODE"),
-                    })
-                    try:
-                        wkb2ix[g.wkb] = ix
-                    except Exception:
-                        pass
-                except Exception:
+            try:
+                geom_data = feat.get("geometry")
+                if not geom_data:
                     continue
+                    
+                g = shape(geom_data)
+                
+                # Repair invalid geometries
+                if not g.is_valid:
+                    try:
+                        g = make_valid(g)
+                    except Exception:
+                        g = g.buffer(0)  # fallback repair method
+                
+                if g.is_empty:
+                    continue
+                
+                # Extract properties
+                pr = feat.get("properties", {})
+                prop_dict = {
+                    "NUTS_ID": pr.get("NUTS_ID", ""),
+                    "NAME_LATN": pr.get("NAME_LATN", ""),
+                    "LEVL_CODE": pr.get("LEVL_CODE", ""),
+                    "CNTR_CODE": pr.get("CNTR_CODE", ""),
+                }
+                
+                geoms.append(g)
+                props.append(prop_dict)
+                
+            except Exception as e:
+                print(f"Warning: Failed to parse feature: {e}")
+                continue
+        
         if not geoms:
-            return {"ok": False, "msg": "No geometries parsed", "tree": None, "geoms": [], "props": [], "wkb2ix": {}, "count": 0}
+            return {
+                "ok": False, 
+                "msg": "No valid geometries found", 
+                "tree": None, 
+                "geoms": [], 
+                "props": [], 
+                "count": 0
+            }
+        
+        # Build spatial index
         tree = STRtree(geoms)
-        return {"ok": True, "msg": "", "tree": tree, "geoms": geoms, "props": props, "wkb2ix": wkb2ix, "count": len(geoms)}
+        
+        return {
+            "ok": True, 
+            "msg": "Success", 
+            "tree": tree, 
+            "geoms": geoms, 
+            "props": props, 
+            "count": len(geoms)
+        }
+        
+    except requests.exceptions.RequestException as e:
+        return {
+            "ok": False, 
+            "msg": f"Network error: {str(e)}", 
+            "tree": None, 
+            "geoms": [], 
+            "props": [], 
+            "count": 0
+        }
     except Exception as e:
-        return {"ok": False, "msg": str(e), "tree": None, "geoms": [], "props": [], "wkb2ix": {}, "count": 0}
+        return {
+            "ok": False, 
+            "msg": f"Error loading NUTS data: {str(e)}", 
+            "tree": None, 
+            "geoms": [], 
+            "props": [], 
+            "count": 0
+        }
 
 @st.cache_resource(show_spinner=False)
 def load_nuts2_index() -> Dict[str, Any]:
-    return _load_nuts_index(NUTS2_URL)
+    """Load NUTS2 index with retry logic"""
+    result = _load_nuts_index(NUTS2_URL)
+    if not result["ok"]:
+        print(f"Warning: Failed to load NUTS2 data: {result['msg']}")
+    return result
 
 @st.cache_resource(show_spinner=False)
 def load_nuts3_index() -> Dict[str, Any]:
-    return _load_nuts_index(NUTS3_URL)
-
+    """Load NUTS3 index with retry logic"""
+    result = _load_nuts_index(NUTS3_URL)
+    if not result["ok"]:
+        print(f"Warning: Failed to load NUTS3 data: {result['msg']}")
+    return result
 
 def _nuts_lookup_generic(idx: Dict[str, Any], lat: float, lon: float) -> Dict[str, Any]:
-    """Robust NUTS point-in-polygon using Shapely 2 STRtree, tolerant to:
-    - boundary points (tiny buffer)
-    - STRtree returning cloned geometries (no shared identity/WKB)"""
-    if not idx.get("ok"):
+    """
+    Improved NUTS point-in-polygon lookup using Shapely STRtree.
+    More robust handling of edge cases and geometry matching.
+    """
+    if not idx.get("ok") or not idx.get("tree"):
         return {}
-
-    pt = Point(float(lon), float(lat))
-
-    # 1) Fast path: predicate-filtered query (Shapely 2)
-    candidates = []
+    
     try:
-        candidates = list(idx["tree"].query(pt, predicate="intersects"))
-    except TypeError:
+        # Create point
+        pt = Point(float(lon), float(lat))
+        
+        # Method 1: Direct STRtree query with predicate
+        candidates_indices = []
         try:
-            candidates = list(idx["tree"].query(pt))
-        except Exception:
-            candidates = []
-
-    # 2) Boundary-safe fallback: query tiny buffer
-    if not candidates:
-        try:
-            candidates = list(idx["tree"].query(pt.buffer(1e-9), predicate="intersects"))
-        except Exception:
+            # For Shapely 2.x with predicate support
+            candidates_indices = list(idx["tree"].query(pt, predicate="intersects"))
+        except TypeError:
+            # Fallback for older Shapely versions
+            candidates = idx["tree"].query(pt)
+            if hasattr(candidates, '__iter__'):
+                # Find indices by comparing geometries
+                for cand in candidates:
+                    for i, geom in enumerate(idx["geoms"]):
+                        if cand is geom or (hasattr(cand, 'equals') and cand.equals(geom)):
+                            candidates_indices.append(i)
+                            break
+        except Exception as e:
+            print(f"Warning: STRtree query failed: {e}")
+        
+        # Check candidates
+        for idx_num in candidates_indices:
+            if 0 <= idx_num < len(idx["props"]):
+                return idx["props"][idx_num]
+        
+        # Method 2: If no direct hit, try with small buffer (for boundary points)
+        if not candidates_indices:
             try:
-                candidates = list(idx["tree"].query(pt.buffer(1e-9)))
+                buffered_pt = pt.buffer(0.0001)  # ~11 meters at equator
+                candidates_indices = list(idx["tree"].query(buffered_pt, predicate="intersects"))
+            except TypeError:
+                candidates = idx["tree"].query(buffered_pt)
+                if hasattr(candidates, '__iter__'):
+                    for cand in candidates:
+                        for i, geom in enumerate(idx["geoms"]):
+                            if cand is geom or (hasattr(cand, 'equals') and cand.equals(geom)):
+                                candidates_indices.append(i)
+                                break
             except Exception:
-                candidates = []
-
-    # Try to resolve candidates back to original list
-    for gc in candidates:
-        try:
-            if not (gc.intersects(pt) or gc.covers(pt) or gc.contains(pt)):
+                pass
+            
+            for idx_num in candidates_indices:
+                if 0 <= idx_num < len(idx["props"]):
+                    # Double-check with actual point
+                    if idx["geoms"][idx_num].contains(pt) or idx["geoms"][idx_num].intersects(pt):
+                        return idx["props"][idx_num]
+        
+        # Method 3: Direct iteration as fallback (works but slower)
+        # This ensures we find a match even if STRtree has issues
+        for i, geom in enumerate(idx["geoms"]):
+            try:
+                if geom.contains(pt) or geom.intersects(pt):
+                    return idx["props"][i]
+            except Exception:
                 continue
-            # geometry-equality attempt
-            for i, g0 in enumerate(idx["geoms"]):
-                try:
-                    if gc.equals(g0) or gc.equals_exact(g0, 1e-12):
-                        return idx["props"][i]
-                except Exception:
-                    continue
-        except Exception:
-            continue
-
-    # Last resort: scan originals (still OK at NUTS scale)
-    for i, g0 in enumerate(idx["geoms"]):
+        
+        # Method 4: Nearest geometry check (for points very close to boundaries)
         try:
-            if g0.covers(pt) or g0.contains(pt) or g0.intersects(pt):
-                return idx["props"][i]
+            nearest_geoms = idx["tree"].nearest(pt)
+            if hasattr(nearest_geoms, '__iter__'):
+                for near_geom in nearest_geoms:
+                    for i, geom in enumerate(idx["geoms"]):
+                        if near_geom is geom or (hasattr(near_geom, 'equals') and near_geom.equals(geom)):
+                            # Check if point is within a small distance
+                            if geom.distance(pt) < 0.001:  # ~110 meters
+                                return idx["props"][i]
+                            break
         except Exception:
-            continue
-
+            pass
+        
+    except Exception as e:
+        print(f"Error in NUTS lookup: {e}")
+    
     return {}
-
-
 
 @st.cache_data(show_spinner=False)
 def nuts2_lookup(lat: float, lon: float) -> Dict[str, Any]:
-    return _nuts_lookup_generic(load_nuts2_index(), lat, lon)
+    """Look up NUTS2 region for a given coordinate"""
+    idx = load_nuts2_index()
+    if not idx.get("ok"):
+        return {}
+    result = _nuts_lookup_generic(idx, lat, lon)
+    if result:
+        print(f"NUTS2 found for ({lat}, {lon}): {result.get('NUTS_ID')}")
+    return result
 
 @st.cache_data(show_spinner=False)
 def nuts3_lookup(lat: float, lon: float) -> Dict[str, Any]:
-    return _nuts_lookup_generic(load_nuts3_index(), lat, lon)
+    """Look up NUTS3 region for a given coordinate"""
+    idx = load_nuts3_index()
+    if not idx.get("ok"):
+        return {}
+    result = _nuts_lookup_generic(idx, lat, lon)
+    if result:
+        print(f"NUTS3 found for ({lat}, {lon}): {result.get('NUTS_ID')}")
+    return result
+
+# Additional debugging function to test NUTS loading
+def test_nuts_loading():
+    """Test function to verify NUTS data is loading correctly"""
+    print("Testing NUTS data loading...")
+    
+    # Test NUTS2
+    nuts2_idx = load_nuts2_index()
+    if nuts2_idx["ok"]:
+        print(f"✓ NUTS2 loaded: {nuts2_idx['count']} regions")
+    else:
+        print(f"✗ NUTS2 failed: {nuts2_idx['msg']}")
+    
+    # Test NUTS3
+    nuts3_idx = load_nuts3_index()
+    if nuts3_idx["ok"]:
+        print(f"✓ NUTS3 loaded: {nuts3_idx['count']} regions")
+    else:
+        print(f"✗ NUTS3 failed: {nuts3_idx['msg']}")
+    
+    # Test lookups with known coordinates
+    test_coords = [
+        (52.2297, 21.0122),  # Warsaw, Poland - should be PL91 (NUTS2) / PL911 (NUTS3)
+        (48.1486, 17.1077),  # Bratislava, Slovakia
+        (50.1109, 8.6821),   # Frankfurt, Germany
+    ]
+    
+    for lat, lon in test_coords:
+        nuts2 = nuts2_lookup(lat, lon)
+        nuts3 = nuts3_lookup(lat, lon)
+        print(f"Coord ({lat}, {lon}):")
+        if nuts2:
+            print(f"  NUTS2: {nuts2.get('NUTS_ID')} - {nuts2.get('NAME_LATN')}")
+        else:
+            print(f"  NUTS2: Not found")
+        if nuts3:
+            print(f"  NUTS3: {nuts3.get('NUTS_ID')} - {nuts3.get('NAME_LATN')}")
+        else:
+            print(f"  NUTS3: Not found")
 
 # ---------------------- OSM Reverse Geocoding ----------------------
 NOMINATIM_REVERSE = "https://nominatim.openstreetmap.org/reverse"
