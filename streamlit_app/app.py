@@ -37,6 +37,7 @@ except Exception:
 try:
     from shapely.geometry import shape, Point  # type: ignore
     from shapely.strtree import STRtree  # type: ignore
+    from shapely.validation import make_valid
     _HAS_SHAPELY = True
 except Exception:
     _HAS_SHAPELY = False
@@ -120,26 +121,32 @@ def _load_nuts_index(url: str) -> Dict[str, Any]:
         geoms: List[Any] = []
         props: List[Dict[str, Any]] = []
         wkb2ix: Dict[bytes, int] = {}
-        for feat in gj.get("features", []):
-            try:
-                g = shape(feat["geometry"])
-                if g.is_empty:
-                    continue
-                ix = len(geoms)
-                geoms.append(g)
-                pr = feat.get("properties", {})
-                props.append({
-                    "NUTS_ID": pr.get("NUTS_ID"),
-                    "NAME_LATN": pr.get("NAME_LATN"),
-                    "LEVL_CODE": pr.get("LEVL_CODE"),
-                    "CNTR_CODE": pr.get("CNTR_CODE"),
-                })
+           for feat in gj.get("features", []):
                 try:
-                    wkb2ix[g.wkb] = ix
+                    g = shape(feat["geometry"])
+                    # repair invalid geometries (common in multi polygons / coastal tiles)
+                    if not g.is_valid:
+                        try:
+                            g = make_valid(g)
+                        except Exception:
+                            g = g.buffer(0)  # fallback
+                    if g.is_empty:
+                        continue
+                    ix = len(geoms)
+                    geoms.append(g)
+                    pr = feat.get("properties", {})
+                    props.append({
+                        "NUTS_ID": pr.get("NUTS_ID"),
+                        "NAME_LATN": pr.get("NAME_LATN"),
+                        "LEVL_CODE": pr.get("LEVL_CODE"),
+                        "CNTR_CODE": pr.get("CNTR_CODE"),
+                    })
+                    try:
+                        wkb2ix[g.wkb] = ix
+                    except Exception:
+                        pass
                 except Exception:
-                    pass
-            except Exception:
-                continue
+                    continue
         if not geoms:
             return {"ok": False, "msg": "No geometries parsed", "tree": None, "geoms": [], "props": [], "wkb2ix": {}, "count": 0}
         tree = STRtree(geoms)
@@ -157,28 +164,25 @@ def load_nuts3_index() -> Dict[str, Any]:
 
 
 def _nuts_lookup_generic(idx: Dict[str, Any], lat: float, lon: float) -> Dict[str, Any]:
-    """Robust NUTS point-in-polygon using Shapely 2 STRtree.
-    - Works when STRtree returns cloned geoms (no shared identity/WKB)
-    - Handles boundary points with a tiny buffer
-    - Falls back to testing original polygons directly
-    """
+    """Robust NUTS point-in-polygon using Shapely 2 STRtree, tolerant to:
+    - boundary points (tiny buffer)
+    - STRtree returning cloned geometries (no shared identity/WKB)"""
     if not idx.get("ok"):
         return {}
 
     pt = Point(float(lon), float(lat))
 
-    # 1) Try predicate-filtered spatial query (Shapely 2)
+    # 1) Fast path: predicate-filtered query (Shapely 2)
     candidates = []
     try:
         candidates = list(idx["tree"].query(pt, predicate="intersects"))
     except TypeError:
-        # Older API without 'predicate' arg → envelope hits
         try:
             candidates = list(idx["tree"].query(pt))
         except Exception:
             candidates = []
 
-    # 2) If nothing, try a tiny buffer to catch boundary touches
+    # 2) Boundary-safe fallback: query tiny buffer
     if not candidates:
         try:
             candidates = list(idx["tree"].query(pt.buffer(1e-9), predicate="intersects"))
@@ -188,36 +192,22 @@ def _nuts_lookup_generic(idx: Dict[str, Any], lat: float, lon: float) -> Dict[st
             except Exception:
                 candidates = []
 
-    # Helper: map a returned candidate geometry back to original list
-    def _props_from_candidate(gc) -> Dict[str, Any] | None:
-        # First try strict geometric equality (fast when it works)
-        for i, g0 in enumerate(idx["geoms"]):
-            try:
-                # equals_exact tolerates tiny numeric noise
-                if gc.equals(g0) or gc.equals_exact(g0, 1e-12):
-                    return idx["props"][i]
-            except Exception:
-                continue
-        # If we didn't match the candidate, just find the first original polygon that covers the point
-        for i, g0 in enumerate(idx["geoms"]):
-            try:
-                if g0.covers(pt) or g0.contains(pt) or g0.intersects(pt):
-                    return idx["props"][i]
-            except Exception:
-                continue
-        return None
-
-    # 3) Resolve each candidate back to a property dict
+    # Try to resolve candidates back to original list
     for gc in candidates:
         try:
-            if gc.covers(pt) or gc.contains(pt) or gc.intersects(pt):
-                pr = _props_from_candidate(gc)
-                if pr:
-                    return pr
+            if not (gc.intersects(pt) or gc.covers(pt) or gc.contains(pt)):
+                continue
+            # geometry-equality attempt
+            for i, g0 in enumerate(idx["geoms"]):
+                try:
+                    if gc.equals(g0) or gc.equals_exact(g0, 1e-12):
+                        return idx["props"][i]
+                except Exception:
+                    continue
         except Exception:
             continue
 
-    # 4) Absolute fallback: scan originals (still cheap at NUTS scale)
+    # Last resort: scan originals (still OK at NUTS scale)
     for i, g0 in enumerate(idx["geoms"]):
         try:
             if g0.covers(pt) or g0.contains(pt) or g0.intersects(pt):
@@ -592,21 +582,24 @@ def process_batch(
                     log_rec["steps"].append({"error": f"Reference: {e}"})
 
             # NUTS enrichment
-            if _HAS_SHAPELY:
-                try:
-                    n2 = nuts2_lookup(lat=slat, lon=slon)
-                    if n2:
-                        out_rec["NUTS2 Code"] = n2.get("NUTS_ID")
-                        out_rec["NUTS2 Name"] = n2.get("NAME_LATN")
-                except Exception as e:
-                    log_rec["steps"].append({"error": f"NUTS2 lookup: {e}"})
-                try:
-                    n3 = nuts3_lookup(lat=slat, lon=slon)
-                    if n3:
-                        out_rec["NUTS3 Code"] = n3.get("NUTS_ID")
-                        out_rec["NUTS3 Name"] = n3.get("NAME_LATN")
-                except Exception as e:
-                    log_rec["steps"].append({"error": f"NUTS3 lookup: {e}"})
+                if _HAS_SHAPELY:
+                    try:
+                        n2 = nuts2_lookup(lat=slat, lon=slon)
+                        if n2:
+                            out_rec["NUTS2 Code"] = n2.get("NUTS_ID")
+                            out_rec["NUTS2 Name"] = n2.get("NAME_LATN")
+                    except Exception as e:
+                        log_rec["steps"].append({"error": f"NUTS2 lookup: {e}"})
+                    try:
+                        n3 = nuts3_lookup(lat=slat, lon=slon)
+                        if n3:
+                            out_rec["NUTS3 Code"] = n3.get("NUTS_ID")
+                            out_rec["NUTS3 Name"] = n3.get("NAME_LATN")
+                    except Exception as e:
+                        log_rec["steps"].append({"error": f"NUTS3 lookup: {e}"})
+                    # simple debug to confirm values being set
+                    log_rec["steps"].append({"msg": f"NUTS: {out_rec.get('NUTS2 Code')} / {out_rec.get('NUTS3 Code')}"})
+
 
             # National polygons (auto) then OSM fallback
             have_official = False
