@@ -5,6 +5,5 @@ requests
 openpyxl
 xlsxwriter
 shapely>=2.0
-# Optional map preview:
-# folium
-# streamlit-folium
+folium
+streamlit-folium
