@@ -121,7 +121,7 @@ def _load_nuts_index(url: str) -> Dict[str, Any]:
         geoms: List[Any] = []
         props: List[Dict[str, Any]] = []
         wkb2ix: Dict[bytes, int] = {}
-           for feat in gj.get("features", []):
+        for feat in gj.get("features", []):
                 try:
                     g = shape(feat["geometry"])
                     # repair invalid geometries (common in multi polygons / coastal tiles)
