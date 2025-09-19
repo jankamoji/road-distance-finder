@@ -874,6 +874,14 @@ def main():
             st.dataframe(df_res, use_container_width=True)
             results_downloads(df_res, filename_prefix="road_distance_results")
 
+            # persist results to survive widget-triggered reruns (e.g., map checkbox)
+            st.session_state["last_results"] = df_res
+            st.session_state["last_logs"] = logs
+            st.session_state["last_api_calls"] = api_calls
+            st.session_state["last_airports"] = airports_df
+            st.session_state["last_seaports"] = seaports_df
+            st.session_state["last_ref_name"] = ref_name
+
             with st.expander("Processing log (per-site)"):
                 for rec in logs:
                     st.write(f"### {rec['site']}")
@@ -882,7 +890,7 @@ def main():
                         if "error" in step: st.error("- " + step["error"])
                         if "fatal" in step: st.error("FATAL: " + step["fatal"])
 
-            if st.checkbox("Show map preview (optional)"):
+            if st.checkbox("Show map preview (optional)", key="show_map"):
                 maybe_map(df_res, airports_df, seaports_df)
 
             if not _HAS_SHAPELY and not st.session_state.get("official_admin"):
@@ -891,6 +899,24 @@ def main():
         except Exception as e:
             st.error(f"Processing failed: {e}")
             st.exception(e)
+
+    # If not running now, show the last successful results (prevents disappearing results on rerun)
+    elif st.session_state.get("last_results") is not None:
+        df_res = st.session_state["last_results"]
+        airports_df = st.session_state.get("last_airports")
+        seaports_df = st.session_state.get("last_seaports")
+        st.subheader("Results (last run)")
+        st.dataframe(df_res, use_container_width=True)
+        results_downloads(df_res, filename_prefix="road_distance_results")
+        with st.expander("Processing log (per-site)"):
+            for rec in st.session_state.get("last_logs", []):
+                st.write(f"### {rec['site']}")
+                for step in rec.get("steps", []):
+                    if "msg" in step: st.write("- " + step["msg"])
+                    if "error" in step: st.error("- " + step["error"])
+                    if "fatal" in step: st.error("FATAL: " + step["fatal"])
+        if st.checkbox("Show map preview (optional)", key="show_map") and airports_df is not None and seaports_df is not None:
+            maybe_map(df_res, airports_df, seaports_df)
 
 if __name__ == "__main__":
     main()
