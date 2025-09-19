@@ -157,51 +157,76 @@ def load_nuts3_index() -> Dict[str, Any]:
 
 
 def _nuts_lookup_generic(idx: Dict[str, Any], lat: float, lon: float) -> Dict[str, Any]:
-    """Robust point-in-polygon for NUTS with Shapely 2 STRtree.
-    Works for boundary points and different STRtree implementations."""
+    """Robust NUTS point-in-polygon using Shapely 2 STRtree.
+    - Works when STRtree returns cloned geoms (no shared identity/WKB)
+    - Handles boundary points with a tiny buffer
+    - Falls back to testing original polygons directly
+    """
     if not idx.get("ok"):
         return {}
+
     pt = Point(float(lon), float(lat))
 
-    # 1) Fast path: predicate-filtered query (Shapely 2)
-    cands = []
+    # 1) Try predicate-filtered spatial query (Shapely 2)
+    candidates = []
     try:
-        # New API: query(..., predicate="intersects")
-        cands = list(idx["tree"].query(pt, predicate="intersects"))
+        candidates = list(idx["tree"].query(pt, predicate="intersects"))
     except TypeError:
-        # Older API: no predicate arg -> envelope query
+        # Older API without 'predicate' arg → envelope hits
         try:
-            cands = list(idx["tree"].query(pt))
+            candidates = list(idx["tree"].query(pt))
         except Exception:
-            cands = []
+            candidates = []
 
-    # 2) Boundary-safe fallback: tiny buffer around the point
-    if not cands:
+    # 2) If nothing, try a tiny buffer to catch boundary touches
+    if not candidates:
         try:
-            cands = list(idx["tree"].query(pt.buffer(1e-9), predicate="intersects"))
+            candidates = list(idx["tree"].query(pt.buffer(1e-9), predicate="intersects"))
         except Exception:
-            # Older API fallback
             try:
-                cands = list(idx["tree"].query(pt.buffer(1e-9)))
+                candidates = list(idx["tree"].query(pt.buffer(1e-9)))
             except Exception:
-                cands = []
+                candidates = []
 
-    # 3) Verify and map to props
-    for g in cands:
+    # Helper: map a returned candidate geometry back to original list
+    def _props_from_candidate(gc) -> Dict[str, Any] | None:
+        # First try strict geometric equality (fast when it works)
+        for i, g0 in enumerate(idx["geoms"]):
+            try:
+                # equals_exact tolerates tiny numeric noise
+                if gc.equals(g0) or gc.equals_exact(g0, 1e-12):
+                    return idx["props"][i]
+            except Exception:
+                continue
+        # If we didn't match the candidate, just find the first original polygon that covers the point
+        for i, g0 in enumerate(idx["geoms"]):
+            try:
+                if g0.covers(pt) or g0.contains(pt) or g0.intersects(pt):
+                    return idx["props"][i]
+            except Exception:
+                continue
+        return None
+
+    # 3) Resolve each candidate back to a property dict
+    for gc in candidates:
         try:
-            if g.covers(pt) or g.contains(pt) or g.intersects(pt):
-                ix = idx["wkb2ix"].get(g.wkb)
-                if ix is None:
-                    try:
-                        ix = idx["geoms"].index(g)
-                    except Exception:
-                        ix = None
-                if ix is not None:
-                    return idx["props"][ix]
+            if gc.covers(pt) or gc.contains(pt) or gc.intersects(pt):
+                pr = _props_from_candidate(gc)
+                if pr:
+                    return pr
+        except Exception:
+            continue
+
+    # 4) Absolute fallback: scan originals (still cheap at NUTS scale)
+    for i, g0 in enumerate(idx["geoms"]):
+        try:
+            if g0.covers(pt) or g0.contains(pt) or g0.intersects(pt):
+                return idx["props"][i]
         except Exception:
             continue
 
     return {}
+
 
 
 @st.cache_data(show_spinner=False)
