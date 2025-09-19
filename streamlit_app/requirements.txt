@@ -7,4 +7,4 @@ xlsxwriter
 shapely>=2.0
 folium
 streamlit-folium
-pip install shapely>=1.8.0 requests
+
