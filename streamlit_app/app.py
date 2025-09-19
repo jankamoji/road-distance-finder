@@ -157,25 +157,36 @@ def load_nuts3_index() -> Dict[str, Any]:
 
 
 def _nuts_lookup_generic(idx: Dict[str, Any], lat: float, lon: float) -> Dict[str, Any]:
-    """Robust point-in-polygon for NUTS with Shapely 2 STRtree."""
+    """Robust point-in-polygon for NUTS with Shapely 2 STRtree.
+    Works for boundary points and different STRtree implementations."""
     if not idx.get("ok"):
         return {}
     pt = Point(float(lon), float(lat))
 
-    # 1) Fast path: predicate-filtered query
+    # 1) Fast path: predicate-filtered query (Shapely 2)
+    cands = []
     try:
+        # New API: query(..., predicate="intersects")
         cands = list(idx["tree"].query(pt, predicate="intersects"))
-    except Exception:
-        cands = []
+    except TypeError:
+        # Older API: no predicate arg -> envelope query
+        try:
+            cands = list(idx["tree"].query(pt))
+        except Exception:
+            cands = []
 
     # 2) Boundary-safe fallback: tiny buffer around the point
     if not cands:
         try:
             cands = list(idx["tree"].query(pt.buffer(1e-9), predicate="intersects"))
         except Exception:
-            cands = []
+            # Older API fallback
+            try:
+                cands = list(idx["tree"].query(pt.buffer(1e-9)))
+            except Exception:
+                cands = []
 
-    # 3) Verify with covers/contains and map to props
+    # 3) Verify and map to props
     for g in cands:
         try:
             if g.covers(pt) or g.contains(pt) or g.intersects(pt):
@@ -779,32 +790,76 @@ def results_downloads(df: pd.DataFrame, filename_prefix: str = "results"):
 
 
 def maybe_map(df: pd.DataFrame, airports: pd.DataFrame, seaports: pd.DataFrame):
+    """Interactive folium map:
+    - Sites = circle markers (as-is)
+    - Airports = plane icon, tooltip shows IATA (falls back to name)
+    - Seaports = ship icon, tooltip shows port name
+    - Reference = truck icon (if set in session)
+    - NO polylines
+    """
     if not _HAS_MAP:
         st.info("Optional map preview requires streamlit-folium and folium. If not installed, the app works without the map.")
         return
-    if df.empty:
+    if df is None or df.empty:
         return
-    st.subheader("Map preview (nearest picks)")
-    mean_lat = df["Latitude"].mean(); mean_lon = df["Longitude"].mean()
+
+    mean_lat = float(df["Latitude"].mean())
+    mean_lon = float(df["Longitude"].mean())
     m = folium.Map(location=[mean_lat, mean_lon], zoom_start=5)
 
+    # --- Sites (as you had them)
     for _, r in df.iterrows():
-        site = [r["Latitude"], r["Longitude"]]
-        folium.CircleMarker(site, radius=5, tooltip=r["Site Name"], fill=True).add_to(m)
+        site = [float(r["Latitude"]), float(r["Longitude"])]
+        folium.CircleMarker(site, radius=5, tooltip=str(r["Site Name"]), fill=True).add_to(m)
 
-        if isinstance(r.get("Nearest Airport"), str) and r.get("Nearest Airport") not in (None, "ERROR"):
-            arow = airports[airports["Airport Name"] == r["Nearest Airport"]]
-            if not arow.empty:
-                a = [float(arow.iloc[0]["Latitude"]), float(arow.iloc[0]["Longitude"])]
-                folium.Marker(a, tooltip=f"Airport: {r['Nearest Airport']}").add_to(m)
-                folium.PolyLine([site, a], weight=2).add_to(m)
+    # --- Airports: plane icon + IATA code
+    # We will read the airport position from the airports dataframe by name (as before)
+    # and show IATA code from results if available; otherwise fall back to df airports column.
+    for _, r in df.iterrows():
+        a_name = r.get("Nearest Airport")
+        if not isinstance(a_name, str) or a_name in (None, "ERROR", ""):
+            continue
+        arow = airports[airports["Airport Name"] == a_name]
+        if arow.empty:
+            continue
+        alat = float(arow.iloc[0]["Latitude"])
+        alon = float(arow.iloc[0]["Longitude"])
+        iata = r.get("Nearest Airport Code")
+        if not iata:
+            iata = str(arow.iloc[0].get("IATA") or "")
+        label = (iata if iata else a_name)
+        folium.Marker(
+            [alat, alon],
+            tooltip=f"✈ {label}",
+            icon=folium.Icon(icon="plane", prefix="fa")
+        ).add_to(m)
 
-        if isinstance(r.get("Nearest Seaport"), str) and r.get("Nearest Seaport") not in (None, "ERROR"):
-            prow = seaports[seaports["Seaport Name"] == r["Nearest Seaport"]]
-            if not prow.empty:
-                p = [float(prow.iloc[0]["Latitude"]), float(prow.iloc[0]["Longitude"])]
-                folium.Marker(p, tooltip=f"Seaport: {r['Nearest Seaport']}").add_to(m)
-                folium.PolyLine([site, p], weight=2).add_to(m)
+    # --- Seaports: ship icon + port name
+    for _, r in df.iterrows():
+        p_name = r.get("Nearest Seaport")
+        if not isinstance(p_name, str) or p_name in (None, "ERROR", ""):
+            continue
+        prow = seaports[seaports["Seaport Name"] == p_name]
+        if prow.empty:
+            continue
+        plat = float(prow.iloc[0]["Latitude"])
+        plon = float(prow.iloc[0]["Longitude"])
+        folium.Marker(
+            [plat, plon],
+            tooltip=f"🛳 {p_name}",
+            icon=folium.Icon(icon="ship", prefix="fa")
+        ).add_to(m)
+
+    # --- Reference: truck icon (if present in session_state)
+    ref_lat = st.session_state.get("ref_lat")
+    ref_lon = st.session_state.get("ref_lon")
+    ref_name = st.session_state.get("ref_name", DEFAULT_REF["name"])
+    if isinstance(ref_lat, (int, float)) and isinstance(ref_lon, (int, float)):
+        folium.Marker(
+            [float(ref_lat), float(ref_lon)],
+            tooltip=f"🚚 {ref_name}",
+            icon=folium.Icon(icon="truck", prefix="fa", color="green")
+        ).add_to(m)
 
     st_folium(m, height=500, use_container_width=True)
 
