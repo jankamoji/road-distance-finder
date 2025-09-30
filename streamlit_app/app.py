@@ -45,11 +45,10 @@ except Exception:
 # ---------------------- App constants ----------------------
 APP_TITLE = "Road Distance Finder"
 DEFAULT_REF = {"name": "Bedburg, Germany", "lat": 51.0126, "lon": 6.5741}
-REQUIRED_SITES_COLS = ["Site Name", "Latitude", "Longitude"]
-REQUIRED_AIRPORTS_COLS = ["Airport Name", "Latitude", "Longitude"]  # IATA optional
-REQUIRED_SEAPORTS_COLS = ["Seaport Name", "Latitude", "Longitude"]  # UNLOCODE optional
-
-ENRICH_DEFAULT_OSM_ADMIN = True  # OSM fallback
+REQUIRED_SITES_COLS = ["Project ID", "Site ID", "Site Name", "Latitude", "Longitude"]  # Added Project ID and Site ID
+REQUIRED_AIRPORTS_COLS = ["Airport Name", "Latitude", "Longitude"]
+REQUIRED_SEAPORTS_COLS = ["Seaport Name", "Latitude", "Longitude"]
+ENRICH_DEFAULT_OSM_ADMIN = True
 
 # ---------------------- Utilities ----------------------
 
@@ -66,19 +65,19 @@ def haversine_km(lat1, lon1, lat2, lon2):
 @st.cache_data(show_spinner=False)
 def template_files() -> Dict[str, bytes]:
     out: Dict[str, bytes] = {}
-
-    # Sites.xlsx
+    
+    # Sites.xlsx - Now includes Project ID and Site ID
     df_sites = pd.DataFrame([
-        {"Site Name": "Example Plant A", "Latitude": 52.2297, "Longitude": 21.0122},
-        {"Site Name": "Example Plant B", "Latitude": 48.1486, "Longitude": 17.1077},
-        {"Site Name": "Example Plant C", "Latitude": 50.1109, "Longitude": 8.6821},
+        {"Project ID": "P-20250101-01", "Site ID": "SK-20250101-01", "Site Name": "Example Plant A", "Latitude": 52.2297, "Longitude": 21.0122},
+        {"Project ID": "P-20250101-01", "Site ID": "SK-20250101-02", "Site Name": "Example Plant B", "Latitude": 48.1486, "Longitude": 17.1077},
+        {"Project ID": "P-20250101-02", "Site ID": "SK-20250102-01", "Site Name": "Example Plant C", "Latitude": 50.1109, "Longitude": 8.6821},
     ])
     b = io.BytesIO()
     with pd.ExcelWriter(b, engine="xlsxwriter") as xw:
         df_sites.to_excel(xw, sheet_name="Sites", index=False)
     out["Sites.xlsx"] = b.getvalue()
-
-    # Airports.xlsx
+    
+    # Airports.xlsx (unchanged)
     df_airports = pd.DataFrame([
         {"Airport Name": "Frankfurt Airport", "IATA": "FRA", "Latitude": 50.0379, "Longitude": 8.5622},
         {"Airport Name": "Warsaw Chopin Airport", "IATA": "WAW", "Latitude": 52.1657, "Longitude": 20.9671},
@@ -90,8 +89,8 @@ def template_files() -> Dict[str, bytes]:
     with pd.ExcelWriter(b, engine="xlsxwriter") as xw:
         df_airports.to_excel(xw, sheet_name="Airports", index=False)
     out["Airports.xlsx"] = b.getvalue()
-
-    # Seaports.xlsx
+    
+    # Seaports.xlsx (unchanged)
     df_ports = pd.DataFrame([
         {"Seaport Name": "Rotterdam", "UNLOCODE": "", "Latitude": 51.9490, "Longitude": 4.1420},
         {"Seaport Name": "Hamburg", "UNLOCODE": "", "Latitude": 53.5461, "Longitude": 9.9661},
@@ -103,8 +102,73 @@ def template_files() -> Dict[str, bytes]:
     with pd.ExcelWriter(b, engine="xlsxwriter") as xw:
         df_ports.to_excel(xw, sheet_name="Seaports", index=False)
     out["Seaports.xlsx"] = b.getvalue()
-
+    
     return out
+
+# ---------------------- New function to create Site Selection Tool format ----------------------
+def create_site_selection_format(df_results: pd.DataFrame, ref_name: str = None) -> pd.DataFrame:
+    """
+    Convert results to long format for Site Selection Tool.
+    Each site-destination combination becomes a separate row.
+    """
+    long_format_rows = []
+    
+    for _, row in df_results.iterrows():
+        # Extract base site information
+        project_id = row.get("Project ID", "")
+        site_id = row.get("Site ID", "")
+        site_name = row.get("Site Name", "")
+        lat = row.get("Latitude", "")
+        lon = row.get("Longitude", "")
+        
+        # Airport record
+        if pd.notna(row.get("Nearest Airport")):
+            long_format_rows.append({
+                "Project ID": project_id,
+                "Project Name": "",  # Can be filled if available
+                "Site ID": site_id,
+                "Site Name": site_name,
+                "LatitudeY": lat,
+                "LongitudeX": lon,
+                "Destination": row.get("Nearest Airport", ""),
+                "Destination group": "Nearest Airport",
+                "Distance (km)": row.get("Distance to Airport (km)", ""),
+                "Accessibility": 1  # Default to 1 for primary transport modes
+            })
+        
+        # Seaport record
+        if pd.notna(row.get("Nearest Seaport")):
+            long_format_rows.append({
+                "Project ID": project_id,
+                "Project Name": "",
+                "Site ID": site_id,
+                "Site Name": site_name,
+                "LatitudeY": lat,
+                "LongitudeX": lon,
+                "Destination": row.get("Nearest Seaport", ""),
+                "Destination group": "Nearest Port",
+                "Distance (km)": row.get("Distance to Seaport (km)", ""),
+                "Accessibility": 1
+            })
+        
+        # Reference location record (if included)
+        if ref_name:
+            ref_dist_col = f"Distance to {ref_name} (km)"
+            if ref_dist_col in row and pd.notna(row[ref_dist_col]):
+                long_format_rows.append({
+                    "Project ID": project_id,
+                    "Project Name": "",
+                    "Site ID": site_id,
+                    "Site Name": site_name,
+                    "LatitudeY": lat,
+                    "LongitudeX": lon,
+                    "Destination": ref_name,
+                    "Destination group": "Reference Location",
+                    "Distance (km)": row.get(ref_dist_col, ""),
+                    "Accessibility": 0  # 0 for reference/auxiliary locations
+                })
+    
+    return pd.DataFrame(long_format_rows)
 
 # ---------------------- NUTS (EU GISCO) — always enrich NUTS2 & NUTS3 ----------------------
 NUTS2_URL = "https://gisco-services.ec.europa.eu/distribution/v2/nuts/geojson/NUTS_RG_01M_2021_4326_LEVL_2.geojson"
@@ -607,43 +671,46 @@ def process_batch(
     pause_every: int,
     pause_secs: float,
     progress_hook=None,
-    enrich_nuts3: bool = True,  # kept for signature; not used directly
+    enrich_nuts3: bool = True,
     enrich_osm_admin: bool = ENRICH_DEFAULT_OSM_ADMIN,
 ) -> Tuple[pd.DataFrame, List[Dict[str, Any]], int]:
-
     sites = sites.copy(); airports = airports.copy(); seaports = seaports.copy()
-
+    
     # Coerce numeric
     for col in ["Latitude", "Longitude"]:
         sites[col] = pd.to_numeric(sites[col], errors="coerce")
         airports[col] = pd.to_numeric(airports[col], errors="coerce")
         seaports[col] = pd.to_numeric(seaports[col], errors="coerce")
-
+    
     err = (
         _validate_latlon(sites["Latitude"], sites["Longitude"]) or
         _validate_latlon(airports["Latitude"], airports["Longitude"]) or
-        _validate_latlon(seaports["Latitude"], seaports["Longitude"]) 
+        _validate_latlon(seaports["Latitude"], seaports["Longitude"])
     )
     if err:
         raise ValueError(err)
-
+    
     a_lat = airports["Latitude"].to_numpy(); a_lon = airports["Longitude"].to_numpy()
     p_lat = seaports["Latitude"].to_numpy(); p_lon = seaports["Longitude"].to_numpy()
-
+    
     route_cache = st.session_state.get("route_cache", {})
-
     results: List[Dict[str, Any]] = []
     logs: List[Dict[str, Any]] = []
     api_calls = 0
     total = len(sites)
-
+    
     for _, row in sites.iterrows():
+        # Include Project ID and Site ID in results
+        project_id = str(row.get("Project ID", "")).strip()
+        site_id = str(row.get("Site ID", "")).strip()
         site_name = str(row["Site Name"]).strip()
         slat = float(row["Latitude"]); slon = float(row["Longitude"])
         site_origin = (slat, slon)
-
+        
         log_rec = {"site": site_name, "steps": []}
         out_rec: Dict[str, Any] = {
+            "Project ID": project_id,
+            "Site ID": site_id,
             "Site Name": site_name,
             "Latitude": round(slat, 6),
             "Longitude": round(slon, 6),
@@ -665,17 +732,19 @@ def process_batch(
             "NUTS3 Code": None,
             "NUTS3 Name": None,
         }
+        
         if include_ref:
             out_rec[f"Distance to {DEFAULT_REF['name']} (km)"] = None
             out_rec[f"Time to {DEFAULT_REF['name']} (min)"] = None
-
+        
         try:
+            # [Rest of the processing logic remains the same as in original]
             # Airports (Top-N by air)
             dists_a = haversine_km(slat, slon, a_lat, a_lon)
             idxs_a = np.argsort(dists_a)[: min(topn, len(airports))]
             cand_airports = airports.iloc[idxs_a].copy()
             log_rec["steps"].append({"msg": f"Top-{len(cand_airports)} airports: {cand_airports['Airport Name'].tolist()}"})
-
+            
             best_air, best_air_d, best_air_t = None, math.inf, math.inf
             for _, a in cand_airports.iterrows():
                 dest = (float(a["Latitude"]), float(a["Longitude"]))
@@ -690,18 +759,19 @@ def process_batch(
                         best_air, best_air_d, best_air_t = a, dist_km, dur_min
                 except Exception as e:
                     log_rec["steps"].append({"error": f"Airport '{a['Airport Name']}': {e}"})
+            
             if best_air is not None:
                 out_rec["Nearest Airport"] = str(best_air.get("Airport Name"))
                 out_rec["Nearest Airport Code"] = str(best_air.get("IATA") or best_air.get("ICAO") or best_air.get("Code") or "")
                 out_rec["Distance to Airport (km)"] = round(best_air_d, 1)
                 out_rec["Time to Airport (min)"] = round(best_air_t, 1)
-
+            
             # Seaports (Top-N by air)
             dists_p = haversine_km(slat, slon, p_lat, p_lon)
             idxs_p = np.argsort(dists_p)[: min(topn, len(seaports))]
             cand_ports = seaports.iloc[idxs_p].copy()
             log_rec["steps"].append({"msg": f"Top-{len(cand_ports)} seaports: {cand_ports['Seaport Name'].tolist()}"})
-
+            
             best_port, best_port_d, best_port_t = None, math.inf, math.inf
             for _, p in cand_ports.iterrows():
                 dest = (float(p["Latitude"]), float(p["Longitude"]))
@@ -716,11 +786,12 @@ def process_batch(
                         best_port, best_port_d, best_port_t = p, dist_km, dur_min
                 except Exception as e:
                     log_rec["steps"].append({"error": f"Seaport '{p['Seaport Name']}': {e}"})
+            
             if best_port is not None:
                 out_rec["Nearest Seaport"] = str(best_port.get("Seaport Name"))
                 out_rec["Distance to Seaport (km)"] = round(best_port_d, 1)
                 out_rec["Time to Seaport (min)"] = round(best_port_t, 1)
-
+            
             # Reference
             if include_ref:
                 try:
@@ -734,28 +805,28 @@ def process_batch(
                     out_rec[f"Time to {DEFAULT_REF['name']} (min)"] = round(dur_min, 1)
                 except Exception as e:
                     log_rec["steps"].append({"error": f"Reference: {e}"})
-
+            
             # NUTS enrichment
-                if _HAS_SHAPELY:
-                    try:
-                        n2 = nuts2_lookup(lat=slat, lon=slon)
-                        if n2:
-                            out_rec["NUTS2 Code"] = n2.get("NUTS_ID")
-                            out_rec["NUTS2 Name"] = n2.get("NAME_LATN")
-                    except Exception as e:
-                        log_rec["steps"].append({"error": f"NUTS2 lookup: {e}"})
-                    try:
-                        n3 = nuts3_lookup(lat=slat, lon=slon)
-                        if n3:
-                            out_rec["NUTS3 Code"] = n3.get("NUTS_ID")
-                            out_rec["NUTS3 Name"] = n3.get("NAME_LATN")
-                    except Exception as e:
-                        log_rec["steps"].append({"error": f"NUTS3 lookup: {e}"})
-                    # simple debug to confirm values being set
-                    log_rec["steps"].append({"msg": f"NUTS: {out_rec.get('NUTS2 Code')} / {out_rec.get('NUTS3 Code')}"})
-
-
-            # National polygons (auto) then OSM fallback
+            if _HAS_SHAPELY:
+                try:
+                    n2 = nuts2_lookup(lat=slat, lon=slon)
+                    if n2:
+                        out_rec["NUTS2 Code"] = n2.get("NUTS_ID")
+                        out_rec["NUTS2 Name"] = n2.get("NAME_LATN")
+                except Exception as e:
+                    log_rec["steps"].append({"error": f"NUTS2 lookup: {e}"})
+                
+                try:
+                    n3 = nuts3_lookup(lat=slat, lon=slon)
+                    if n3:
+                        out_rec["NUTS3 Code"] = n3.get("NUTS_ID")
+                        out_rec["NUTS3 Name"] = n3.get("NAME_LATN")
+                except Exception as e:
+                    log_rec["steps"].append({"error": f"NUTS3 lookup: {e}"})
+                
+                log_rec["steps"].append({"msg": f"NUTS: {out_rec.get('NUTS2 Code')} / {out_rec.get('NUTS3 Code')}"})
+            
+            # National polygons and OSM fallback (same as original)
             have_official = False
             try:
                 auto = st.session_state.get("official_admin", {})
@@ -780,7 +851,7 @@ def process_batch(
                         have_official = True
             except Exception as e:
                 log_rec["steps"].append({"error": f"Official admin lookup: {e}"})
-
+            
             if enrich_osm_admin and not have_official:
                 try:
                     adm = osm_reverse(slat, slon)
@@ -792,15 +863,16 @@ def process_batch(
                     out_rec["Voivodeship Code"] = adm.get("voivodeship_code") or out_rec.get("Voivodeship Code")
                 except Exception as e:
                     log_rec["steps"].append({"error": f"OSM admin reverse: {e}"})
-
+        
         except Exception as e:
             log_rec["steps"].append({"fatal": str(e)})
-
+        
         logs.append(log_rec)
         results.append(out_rec)
+        
         if progress_hook:
             progress_hook(f"Processed {len(results)}/{total}")
-
+    
     st.session_state["route_cache"] = route_cache
     df_res = pd.DataFrame(results)
     return df_res, logs, api_calls
@@ -950,43 +1022,85 @@ def upload_area() -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     return sites_df, airports_df, seaports_df
 
 
-def results_downloads(df: pd.DataFrame, filename_prefix: str = "results"):
+def results_downloads(df: pd.DataFrame, ref_name: str = None, filename_prefix: str = "results"):
     st.subheader("Downloads")
+    
+    # Standard exports
     csv_bytes = df.to_csv(index=False).encode("utf-8")
-    st.download_button("Download CSV", data=csv_bytes, file_name=f"{filename_prefix}.csv")
-
-    bio = io.BytesIO()
-    with pd.ExcelWriter(bio, engine="xlsxwriter") as xw:
-        df.to_excel(xw, index=False, sheet_name="Results")
-    st.download_button("Download XLSX", data=bio.getvalue(), file_name=f"{filename_prefix}.xlsx")
+    col1, col2, col3 = st.columns(3)
+    
+    with col1:
+        st.download_button("📄 Download CSV", data=csv_bytes, file_name=f"{filename_prefix}.csv")
+    
+    with col2:
+        bio = io.BytesIO()
+        with pd.ExcelWriter(bio, engine="xlsxwriter") as xw:
+            df.to_excel(xw, index=False, sheet_name="Results")
+        st.download_button("📊 Download XLSX", data=bio.getvalue(), file_name=f"{filename_prefix}.xlsx")
+    
+    # Site Selection Tool format
+    with col3:
+        df_long = create_site_selection_format(df, ref_name=ref_name)
+        bio_long = io.BytesIO()
+        with pd.ExcelWriter(bio_long, engine="xlsxwriter") as xw:
+            df_long.to_excel(xw, index=False, sheet_name="SiteSelection")
+        st.download_button(
+            "🎯 Export for Site Selection Tool",
+            data=bio_long.getvalue(),
+            file_name=f"{filename_prefix}_site_selection.xlsx",
+            help="Long format with individual records per destination"
+        )
 
 
 def maybe_map(df: pd.DataFrame, airports: pd.DataFrame, seaports: pd.DataFrame):
-    """Interactive folium map:
-    - Sites = circle markers (as-is)
-    - Airports = plane icon, tooltip shows IATA (falls back to name)
-    - Seaports = ship icon, tooltip shows port name
-    - Reference = truck icon (if set in session)
-    - NO polylines
-    """
+    """Interactive folium map with fullscreen capability"""
     if not _HAS_MAP:
         st.info("Optional map preview requires streamlit-folium and folium. If not installed, the app works without the map.")
         return
+    
     if df is None or df.empty:
         return
-
+    
+    # Import fullscreen plugin if available
+    try:
+        from folium.plugins import Fullscreen
+        has_fullscreen = True
+    except ImportError:
+        has_fullscreen = False
+    
     mean_lat = float(df["Latitude"].mean())
     mean_lon = float(df["Longitude"].mean())
     m = folium.Map(location=[mean_lat, mean_lon], zoom_start=5)
-
-    # --- Sites (as you had them)
+    
+    # Add fullscreen button if available
+    if has_fullscreen:
+        Fullscreen(
+            position="topleft",
+            title="Expand to fullscreen",
+            title_cancel="Exit fullscreen",
+            force_separate_button=True,
+        ).add_to(m)
+    
+    # Sites
     for _, r in df.iterrows():
         site = [float(r["Latitude"]), float(r["Longitude"])]
-        folium.CircleMarker(site, radius=5, tooltip=str(r["Site Name"]), fill=True).add_to(m)
-
-    # --- Airports: plane icon + IATA code
-    # We will read the airport position from the airports dataframe by name (as before)
-    # and show IATA code from results if available; otherwise fall back to df airports column.
+        popup_text = f"""
+        <b>{r['Site Name']}</b><br>
+        Project: {r.get('Project ID', 'N/A')}<br>
+        Site ID: {r.get('Site ID', 'N/A')}<br>
+        Coords: {r['Latitude']:.4f}, {r['Longitude']:.4f}
+        """
+        folium.CircleMarker(
+            site,
+            radius=5,
+            tooltip=str(r["Site Name"]),
+            popup=folium.Popup(popup_text, max_width=300),
+            fill=True,
+            color='blue',
+            fillColor='lightblue'
+        ).add_to(m)
+    
+    # Airports
     for _, r in df.iterrows():
         a_name = r.get("Nearest Airport")
         if not isinstance(a_name, str) or a_name in (None, "ERROR", ""):
@@ -1000,13 +1114,22 @@ def maybe_map(df: pd.DataFrame, airports: pd.DataFrame, seaports: pd.DataFrame):
         if not iata:
             iata = str(arow.iloc[0].get("IATA") or "")
         label = (iata if iata else a_name)
+        
+        popup_text = f"""
+        <b>✈ {a_name}</b><br>
+        IATA: {iata if iata else 'N/A'}<br>
+        Distance: {r.get('Distance to Airport (km)', 'N/A')} km<br>
+        Time: {r.get('Time to Airport (min)', 'N/A')} min
+        """
+        
         folium.Marker(
             [alat, alon],
             tooltip=f"✈ {label}",
-            icon=folium.Icon(icon="plane", prefix="fa")
+            popup=folium.Popup(popup_text, max_width=300),
+            icon=folium.Icon(icon="plane", prefix="fa", color='red')
         ).add_to(m)
-
-    # --- Seaports: ship icon + port name
+    
+    # Seaports
     for _, r in df.iterrows():
         p_name = r.get("Nearest Seaport")
         if not isinstance(p_name, str) or p_name in (None, "ERROR", ""):
@@ -1016,23 +1139,38 @@ def maybe_map(df: pd.DataFrame, airports: pd.DataFrame, seaports: pd.DataFrame):
             continue
         plat = float(prow.iloc[0]["Latitude"])
         plon = float(prow.iloc[0]["Longitude"])
+        
+        popup_text = f"""
+        <b>🛳 {p_name}</b><br>
+        Distance: {r.get('Distance to Seaport (km)', 'N/A')} km<br>
+        Time: {r.get('Time to Seaport (min)', 'N/A')} min
+        """
+        
         folium.Marker(
             [plat, plon],
             tooltip=f"🛳 {p_name}",
-            icon=folium.Icon(icon="ship", prefix="fa")
+            popup=folium.Popup(popup_text, max_width=300),
+            icon=folium.Icon(icon="ship", prefix="fa", color='darkblue')
         ).add_to(m)
-
-    # --- Reference: truck icon (if present in session_state)
+    
+    # Reference location
     ref_lat = st.session_state.get("ref_lat")
     ref_lon = st.session_state.get("ref_lon")
     ref_name = st.session_state.get("ref_name", DEFAULT_REF["name"])
     if isinstance(ref_lat, (int, float)) and isinstance(ref_lon, (int, float)):
+        popup_text = f"""
+        <b>🚚 Reference Location</b><br>
+        {ref_name}<br>
+        Coords: {ref_lat:.4f}, {ref_lon:.4f}
+        """
         folium.Marker(
             [float(ref_lat), float(ref_lon)],
             tooltip=f"🚚 {ref_name}",
+            popup=folium.Popup(popup_text, max_width=300),
             icon=folium.Icon(icon="truck", prefix="fa", color="green")
         ).add_to(m)
-
+    
+    # Display map
     st_folium(m, height=500, use_container_width=True)
 
 # ---------------------- Main ----------------------
