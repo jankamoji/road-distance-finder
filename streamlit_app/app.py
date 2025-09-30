@@ -1042,27 +1042,29 @@ def main():
     st.title(APP_TITLE)
     st.caption(
         "Compute road distance/time from sites to nearest airport and container seaport (Top-N prefilter), "
-        "optional reference location, and national + NUTS enrichment."
+        "optional reference location, and national + NUTS enrichment. Now with Site Selection Tool export format!"
     )
-
+    
     (topn, pause_every, pause_secs, use_ref, ref_name, ref_lat, ref_lon, enrich_osm_admin) = sidebar()
-
+    
     download_buttons_area()
-
     sites_df, airports_df, seaports_df = upload_area()
-
-    run = st.button("Run batch")
-
+    
+    run = st.button("🚀 Run batch", type="primary")
+    
     if run:
         if sites_df is None or airports_df is None or seaports_df is None:
             st.error("Upload all three templates with correct columns.")
             return
+        
         if len(airports_df) == 0 or len(seaports_df) == 0 or len(sites_df) == 0:
             st.error("Uploaded files must contain at least one row in each sheet.")
             return
-
-        status = st.empty(); pbar = st.progress(0); total = len(sites_df)
-
+        
+        status = st.empty()
+        pbar = st.progress(0)
+        total = len(sites_df)
+        
         def progress_hook(msg: str):
             if "Processed" in msg:
                 parts = msg.split()
@@ -1072,12 +1074,10 @@ def main():
                 except Exception:
                     pass
             status.info(msg)
-
+        
         try:
             df_res, logs, api_calls = process_batch(
-                sites_df,
-                airports_df,
-                seaports_df,
+                sites_df, airports_df, seaports_df,
                 topn=int(topn),
                 include_ref=use_ref,
                 ref_lat=float(ref_lat),
@@ -1088,75 +1088,93 @@ def main():
                 enrich_nuts3=True,
                 enrich_osm_admin=enrich_osm_admin,
             )
-
-            st.success(f"Completed. API calls: {api_calls}. Cached routes: {len(st.session_state.get('route_cache', {}))}.")
+            
+            st.success(f"✅ Completed. API calls: {api_calls}. Cached routes: {len(st.session_state.get('route_cache', {}))}.")
+            
             if api_calls == 0:
                 st.warning("No successful routing calls. See Processing log below.")
-
+            
+            # Rename reference columns if needed
             if use_ref:
                 df_res = df_res.rename(columns={
                     f"Distance to {DEFAULT_REF['name']} (km)": f"Distance to {ref_name} (km)",
                     f"Time to {DEFAULT_REF['name']} (min)": f"Time to {ref_name} (min)",
                 })
-
+            
+            # Organize columns with Project ID and Site ID first
             cols = [
-                "Site Name","Latitude","Longitude",
-                "Nearest Airport","Nearest Airport Code","Distance to Airport (km)","Time to Airport (min)",
-                "Nearest Seaport","Distance to Seaport (km)","Time to Seaport (min)",
-                "Municipality","Municipality Code","County","County Code","Voivodeship","Voivodeship Code",
-                "NUTS2 Code","NUTS2 Name","NUTS3 Code","NUTS3 Name",
+                "Project ID", "Site ID", "Site Name", "Latitude", "Longitude",
+                "Nearest Airport", "Nearest Airport Code", "Distance to Airport (km)", "Time to Airport (min)",
+                "Nearest Seaport", "Distance to Seaport (km)", "Time to Seaport (min)",
+                "Municipality", "Municipality Code", "County", "County Code", "Voivodeship", "Voivodeship Code",
+                "NUTS2 Code", "NUTS2 Name", "NUTS3 Code", "NUTS3 Name",
             ]
             if use_ref:
                 cols += [f"Distance to {ref_name} (km)", f"Time to {ref_name} (min)"]
+            
             cols = [c for c in cols if c in df_res.columns]
             df_res = df_res[cols]
-
-            st.subheader("Results")
+            
+            st.subheader("📊 Results")
             st.dataframe(df_res, use_container_width=True)
-            results_downloads(df_res, filename_prefix="road_distance_results")
-
-            # persist results to survive widget-triggered reruns (e.g., map checkbox)
+            
+            # Enhanced downloads with Site Selection Tool format
+            results_downloads(df_res, ref_name=ref_name if use_ref else None, filename_prefix="road_distance_results")
+            
+            # Persist results to survive widget-triggered reruns (e.g., map checkbox)
             st.session_state["last_results"] = df_res
             st.session_state["last_logs"] = logs
             st.session_state["last_api_calls"] = api_calls
             st.session_state["last_airports"] = airports_df
             st.session_state["last_seaports"] = seaports_df
-            st.session_state["last_ref_name"] = ref_name
-
-            with st.expander("Processing log (per-site)"):
+            st.session_state["last_ref_name"] = ref_name if use_ref else None
+            
+            with st.expander("🔍 Processing log (per-site)"):
                 for rec in logs:
                     st.write(f"### {rec['site']}")
                     for step in rec["steps"]:
-                        if "msg" in step: st.write("- " + step["msg"])
-                        if "error" in step: st.error("- " + step["error"])
-                        if "fatal" in step: st.error("FATAL: " + step["fatal"])
-
-            if st.checkbox("Show map preview (optional)", key="show_map"):
+                        if "msg" in step:
+                            st.write("- " + step["msg"])
+                        if "error" in step:
+                            st.error("- " + step["error"])
+                        if "fatal" in step:
+                            st.error("FATAL: " + step["fatal"])
+            
+            if st.checkbox("🗺️ Show map preview (optional)", key="show_map"):
                 maybe_map(df_res, airports_df, seaports_df)
-
+            
             if not _HAS_SHAPELY and not st.session_state.get("official_admin"):
                 st.warning("Shapely not installed and no national admin indices loaded; only OSM reverse will be used.")
-
+        
         except Exception as e:
             st.error(f"Processing failed: {e}")
             st.exception(e)
-
+    
     # If not running now, show the last successful results (prevents disappearing results on rerun)
     elif st.session_state.get("last_results") is not None:
         df_res = st.session_state["last_results"]
         airports_df = st.session_state.get("last_airports")
         seaports_df = st.session_state.get("last_seaports")
-        st.subheader("Results (last run)")
+        ref_name_cached = st.session_state.get("last_ref_name")
+        
+        st.subheader("📊 Results (last run)")
         st.dataframe(df_res, use_container_width=True)
-        results_downloads(df_res, filename_prefix="road_distance_results")
-        with st.expander("Processing log (per-site)"):
+        
+        # Enhanced downloads with Site Selection Tool format
+        results_downloads(df_res, ref_name=ref_name_cached, filename_prefix="road_distance_results")
+        
+        with st.expander("🔍 Processing log (per-site)"):
             for rec in st.session_state.get("last_logs", []):
                 st.write(f"### {rec['site']}")
                 for step in rec.get("steps", []):
-                    if "msg" in step: st.write("- " + step["msg"])
-                    if "error" in step: st.error("- " + step["error"])
-                    if "fatal" in step: st.error("FATAL: " + step["fatal"])
-        if st.checkbox("Show map preview (optional)", key="show_map") and airports_df is not None and seaports_df is not None:
+                    if "msg" in step:
+                        st.write("- " + step["msg"])
+                    if "error" in step:
+                        st.error("- " + step["error"])
+                    if "fatal" in step:
+                        st.error("FATAL: " + step["fatal"])
+        
+        if st.checkbox("🗺️ Show map preview (optional)", key="show_map") and airports_df is not None and seaports_df is not None:
             maybe_map(df_res, airports_df, seaports_df)
 
 if __name__ == "__main__":
